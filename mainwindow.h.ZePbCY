@@ -1,0 +1,158 @@
+#ifndef MAINWINDOW_H
+#define MAINWINDOW_H
+
+#include <QApplication>
+#include <QWidget>
+#include <QPlainTextEdit>
+#include <QPushButton>
+#include <QSpinBox>
+#include <QVBoxLayout>
+#include <QTimer>
+#include <QKeyEvent>
+#include <QDebug>
+#include <windows.h>
+
+QT_BEGIN_NAMESPACE
+namespace Ui {
+class MainWindow;
+}
+QT_END_NAMESPACE
+
+class MainWindow : public QWidget {
+    Q_OBJECT
+public:
+    MainWindow(QWidget *parent = nullptr) : QWidget(parent) {
+        input = new QPlainTextEdit(this);
+        startBtn = new QPushButton("Start Typing", this);
+        speedSpin = new QSpinBox(this);
+
+        speedSpin->setRange(10, 2000); // milliseconds per char
+        speedSpin->setValue(58);
+
+        QVBoxLayout *layout = new QVBoxLayout(this);
+        layout->addWidget(input);
+        layout->addWidget(speedSpin);
+        layout->addWidget(startBtn);
+        setLayout(layout);
+
+        connect(startBtn, &QPushButton::clicked, this, &MainWindow::onStartClicked);
+    }
+
+private slots:
+    void onStartClicked() {
+        textToType = input->toPlainText();
+        currentIndex = 0;
+
+        // Hide or minimize self to give focus to last active window
+        this->hide(); // could also use showMinimized();
+
+        if(timer) {
+            timer->stop();
+            delete timer;
+        }
+
+        timer = new QTimer(this);
+        connect(timer, &QTimer::timeout, this, &MainWindow::typeNextChar);
+        timer->start(speedSpin->value());
+    }
+
+    void typeNextChar() {
+        if(currentIndex < textToType.length()) {
+
+            QChar c = textToType[currentIndex];
+            WORD scan = scanFromChar(c);
+
+            if(scan != 0)
+                injectScanKey(scan);
+
+            currentIndex++;
+        }
+        else {
+            timer->stop();
+            delete timer;
+            timer = nullptr;
+
+            this->show();
+            this->raise();
+            this->activateWindow();
+        }
+    }
+
+    WORD scanFromChar(QChar c)
+    {
+        switch (c.unicode())
+        {
+        case 'a': case 'A': return 0x1E;
+        case 'b': case 'B': return 0x30;
+        case 'c': case 'C': return 0x2E;
+        case 'd': case 'D': return 0x20;
+        case 'e': case 'E': return 0x12;
+        case 'f': case 'F': return 0x21;
+        case 'g': case 'G': return 0x22;
+        case 'h': case 'H': return 0x23;
+        case 'i': case 'I': return 0x17;
+        case 'j': case 'J': return 0x24;
+        case 'k': case 'K': return 0x25;
+        case 'l': case 'L': return 0x26;
+        case 'm': case 'M': return 0x32;
+        case 'n': case 'N': return 0x31;
+        case 'o': case 'O': return 0x18;
+        case 'p': case 'P': return 0x19;
+        case 'q': case 'Q': return 0x10;
+        case 'r': case 'R': return 0x13;
+        case 's': case 'S': return 0x1F;
+        case 't': case 'T': return 0x14;
+        case 'u': case 'U': return 0x16;
+        case 'v': case 'V': return 0x2F;
+        case 'w': case 'W': return 0x11;
+        case 'x': case 'X': return 0x2D;
+        case 'y': case 'Y': return 0x15;
+        case 'z': case 'Z': return 0x2C;
+
+        case '0': return 0x0B;
+        case '1': return 0x02;
+        case '2': return 0x03;
+        case '3': return 0x04;
+        case '4': return 0x05;
+        case '5': return 0x06;
+        case '6': return 0x07;
+        case '7': return 0x08;
+        case '8': return 0x09;
+        case '9': return 0x0A;
+
+        case ' ': return 0x39;
+
+        // NEWLINE → ENTER
+        case 0x0A: // LF '\n'
+        case 0x0D: // CR '\r'
+            return 0x1C; // Enter
+
+        default:
+            return 0;
+        }
+    }
+
+    void injectScanKey(WORD scanCode) {
+        INPUT ip{};
+
+        ip.type = INPUT_KEYBOARD;
+        ip.ki.wScan = scanCode;
+        ip.ki.dwFlags = KEYEVENTF_SCANCODE;   // key down
+        SendInput(1, &ip, sizeof(INPUT));
+
+        ip.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP; // key up
+        SendInput(1, &ip, sizeof(INPUT));
+    }
+
+
+
+private:
+    QPlainTextEdit *input;
+    QPushButton *startBtn;
+    QSpinBox *speedSpin;
+    QTimer *timer = nullptr;
+    QString textToType;
+    int currentIndex = 0;
+};
+
+#endif // MAINWINDOW_H

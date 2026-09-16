@@ -1,112 +1,64 @@
 #ifndef MAINWINDOW_H
 #define MAINWINDOW_H
 
-#include <QApplication>
 #include <QWidget>
-#include <QPlainTextEdit>
-#include <QPushButton>
-#include <QSpinBox>
-#include <QVBoxLayout>
-#include <QTimer>
-#include <QKeyEvent>
-#include <QDebug>
-#include <windows.h>
+#include <QAbstractNativeEventFilter>
+#include <QPoint>
 
-QT_BEGIN_NAMESPACE
-namespace Ui {
-class MainWindow;
-}
-QT_END_NAMESPACE
+class QCheckBox;
+class QCloseEvent;
+class QEvent;
+class QLabel;
+class QPlainTextEdit;
+class QPushButton;
+class QTimer;
+class StopOverlay;
+class TypingEngine;
 
-class MainWindow : public QWidget {
+class MainWindow : public QWidget, public QAbstractNativeEventFilter
+{
     Q_OBJECT
 public:
-    MainWindow(QWidget *parent = nullptr) : QWidget(parent) {
-        input = new QPlainTextEdit(this);
-        startBtn = new QPushButton("Start Typing", this);
-        speedSpin = new QSpinBox(this);
+    explicit MainWindow(QWidget *parent = nullptr);
+    ~MainWindow() override;
 
-        speedSpin->setRange(10, 2000); // milliseconds per char
-        speedSpin->setValue(58);
+    bool nativeEventFilter(const QByteArray &eventType, void *message, qintptr *result) override;
 
-        QVBoxLayout *layout = new QVBoxLayout(this);
-        layout->addWidget(input);
-        layout->addWidget(speedSpin);
-        layout->addWidget(startBtn);
-        setLayout(layout);
-
-        connect(startBtn, &QPushButton::clicked, this, &MainWindow::onStartClicked);
-    }
+protected:
+    void changeEvent(QEvent *event) override;
+    void closeEvent(QCloseEvent *event) override;
 
 private slots:
-    void onStartClicked() {
-        textToType = input->toPlainText();
-        currentIndex = 0;
-
-        // Hide or minimize self to give focus to last active window
-        this->hide(); // could also use showMinimized();
-
-        if(timer) {
-            timer->stop();
-            delete timer;
-        }
-
-        timer = new QTimer(this);
-        connect(timer, &QTimer::timeout, this, &MainWindow::typeNextChar);
-        timer->start(speedSpin->value());
-    }
-
-    void typeNextChar() {
-        if (currentIndex < textToType.length()) {
-
-            QChar c = textToType[currentIndex];
-            qDebug() << c << c.unicode();
-
-            INPUT ip{};
-            ip.type = INPUT_KEYBOARD;
-            ip.ki.dwExtraInfo = 0;
-
-            // Qt new line is 0x0A (LF)
-            if (c.unicode() == 0x0A) {
-                // ---- SEND REAL ENTER ----
-                ip.ki.wVk = VK_RETURN;
-                ip.ki.dwFlags = 0; // key down
-                SendInput(1, &ip, sizeof(INPUT));
-
-                ip.ki.dwFlags = KEYEVENTF_KEYUP; // key up
-                SendInput(1, &ip, sizeof(INPUT));
-            }
-            else {
-                // ---- SEND UNICODE CHARACTER ----
-                ip.ki.wVk = 0;
-                ip.ki.wScan = c.unicode();
-                ip.ki.dwFlags = KEYEVENTF_UNICODE;
-                SendInput(1, &ip, sizeof(INPUT));
-
-                ip.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-                SendInput(1, &ip, sizeof(INPUT));
-            }
-
-            currentIndex++;
-        }
-        else {
-            timer->stop();
-            delete timer;
-            timer = nullptr;
-
-            this->show();
-            this->raise();
-            this->activateWindow();
-        }
-    }
+    void onStartClicked();
+    void onTypingFinished();
+    void requestStop();
+    void onOverlayHidden();
+    void pollGuards();
+    void onTextChanged();
 
 private:
-    QPlainTextEdit *input;
-    QPushButton *startBtn;
-    QSpinBox *speedSpin;
-    QTimer *timer = nullptr;
-    QString textToType;
-    int currentIndex = 0;
+    void setupUi();
+    void applyTheme();
+    void beginSession();
+    void endSession(bool completed);
+    void registerEscHotkey(bool enable);
+    void updateCounts();
+
+    QPlainTextEdit *input = nullptr;
+    QPushButton *startBtn = nullptr;
+    QCheckBox *autoIndentBox = nullptr;
+    QLabel *countLabel = nullptr;
+    QLabel *statusLabel = nullptr;
+    QTimer *guardTimer = nullptr;
+    TypingEngine *engine = nullptr;
+    StopOverlay *overlay = nullptr;
+
+    bool sessionActive = false;
+    bool endingSession = false;
+    bool clickArmed = false;
+    bool completedRun = false;
+    QPoint originPos;
+    static constexpr int kEscHotkeyId = 1;
 };
 
 #endif // MAINWINDOW_H

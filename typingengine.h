@@ -27,7 +27,6 @@ public:
     int forWrongKey();
     int realizePause() const;
     int rapidBackspace() const;
-    int settlePause() const;
 
 private:
     int wordBaseMs = 70;
@@ -41,11 +40,18 @@ public:
     explicit TypingEngine(QObject *parent = nullptr);
 
     void start(const QString &text, bool autoIndent);
-    void stop();
+    void pause();
+    void resume();
+    void reset();
     bool isRunning() const { return running; }
+    bool canResume() const;
+    int currentIndex() const { return index; }
+    int actionCount() const { return actions.size(); }
+    int percent() const;
 
 signals:
     void finished();
+    void progressChanged(int percent);
 
 private:
     enum class Phase {
@@ -59,6 +65,9 @@ private:
 
     void onTick();
     void schedule();
+    void abortTypoCleanup();
+    void finishRun();
+    void notifyProgress();
     void sendAction(const TypeAction &action);
     void sendWrongKey();
     bool shouldStartTypo() const;

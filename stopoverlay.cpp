@@ -1,6 +1,7 @@
 #include "stopoverlay.h"
 
 #include <QCursor>
+#include <QFrame>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -8,9 +9,10 @@
 #include <QPropertyAnimation>
 #include <QPushButton>
 #include <QScreen>
-#include <QShowEvent>
 #include <QEasingCurve>
 #include <QGraphicsDropShadowEffect>
+#include <QTimer>
+#include <QtGlobal>
 
 StopOverlay::StopOverlay(QWidget *parent)
     : QWidget(parent, Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint | Qt::Tool)
@@ -21,74 +23,87 @@ StopOverlay::StopOverlay(QWidget *parent)
     setFocusPolicy(Qt::NoFocus);
     setWindowTitle(QStringLiteral("TypeHelper"));
 
-    button = new QPushButton(this);
-    button->setCursor(Qt::PointingHandCursor);
-    button->setFocusPolicy(Qt::NoFocus);
-    button->setObjectName(QStringLiteral("stopAutoBtn"));
-    button->setStyleSheet(QStringLiteral(
-        "QPushButton#stopAutoBtn {"
+    auto *pill = new QFrame(this);
+    pill->setObjectName(QStringLiteral("progressPill"));
+    pill->setFixedSize(112, 36);
+    pill->setStyleSheet(QStringLiteral(
+        "#progressPill {"
         "  background-color: #dc2626;"
+        "  border: none;"
+        "  border-radius: 18px;"
+        "}"
+        "QLabel#percentLabel {"
+        "  background: transparent;"
         "  color: #ffffff;"
-        "  border: 2px solid #ffffff;"
-        "  border-radius: 10px;"
-        "  padding: 10px 22px;"
         "}"
-        "QPushButton#stopAutoBtn:hover {"
-        "  background-color: #b91c1c;"
+        "QPushButton#closeBtn {"
+        "  background: transparent;"
+        "  color: #ffffff;"
+        "  border: none;"
+        "  border-radius: 14px;"
         "}"
-        "QPushButton#stopAutoBtn:pressed {"
-        "  background-color: #991b1b;"
+        "QPushButton#closeBtn:hover {"
+        "  background-color: rgba(0, 0, 0, 90);"
         "}"
-        "QLabel { background: transparent; color: #ffffff; }"));
+        "QPushButton#closeBtn:pressed {"
+        "  background-color: rgba(0, 0, 0, 140);"
+        "}"));
 
-    auto *icon = new QLabel(QStringLiteral("✕"), button);
-    icon->setAlignment(Qt::AlignCenter);
-    icon->setAttribute(Qt::WA_TransparentForMouseEvents);
-    QFont iconFont = icon->font();
-    iconFont.setPixelSize(18);
-    iconFont.setBold(true);
-    icon->setFont(iconFont);
-    icon->setFixedWidth(28);
+    percentLabel = new QLabel(QStringLiteral("0%"), pill);
+    percentLabel->setObjectName(QStringLiteral("percentLabel"));
+    percentLabel->setAlignment(Qt::AlignCenter);
+    percentLabel->setAttribute(Qt::WA_TransparentForMouseEvents);
+    QFont percentFont = percentLabel->font();
+    percentFont.setPixelSize(13);
+    percentFont.setBold(true);
+    percentLabel->setFont(percentFont);
 
-    auto *text = new QLabel(QStringLiteral("Stop auto typing, switching to Hot Key - Esc."), button);
-    text->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
-    text->setAttribute(Qt::WA_TransparentForMouseEvents);
-    text->setWordWrap(false);
-    QFont textFont = text->font();
-    textFont.setPixelSize(13);
-    textFont.setWeight(QFont::DemiBold);
-    text->setFont(textFont);
+    closeBtn = new QPushButton(QStringLiteral("✕"), pill);
+    closeBtn->setObjectName(QStringLiteral("closeBtn"));
+    closeBtn->setCursor(Qt::PointingHandCursor);
+    closeBtn->setFocusPolicy(Qt::NoFocus);
+    closeBtn->setFixedSize(28, 28);
+    QFont closeFont = closeBtn->font();
+    closeFont.setPixelSize(13);
+    closeFont.setBold(true);
+    closeBtn->setFont(closeFont);
 
-    auto *row = new QHBoxLayout(button);
-    row->setContentsMargins(18, 6, 18, 6);
-    row->setSpacing(10);
-    row->addStretch();
-    row->addWidget(icon);
-    row->addWidget(text);
-    row->addStretch();
+    auto *leftPad = new QWidget(pill);
+    leftPad->setFixedSize(28, 28);
+    leftPad->setAttribute(Qt::WA_TransparentForMouseEvents);
 
-    button->setMinimumHeight(44);
-    button->setMinimumWidth(520);
+    auto *row = new QHBoxLayout(pill);
+    row->setContentsMargins(4, 0, 4, 0);
+    row->setSpacing(0);
+    row->addWidget(leftPad);
+    row->addWidget(percentLabel, 1);
+    row->addWidget(closeBtn);
 
     auto *root = new QHBoxLayout(this);
-    root->setContentsMargins(16, 16, 16, 16);
-    root->addWidget(button);
+    root->setContentsMargins(10, 10, 10, 10);
+    root->addWidget(pill);
 
-    auto *shadow = new QGraphicsDropShadowEffect(button);
-    shadow->setBlurRadius(24);
-    shadow->setOffset(0, 6);
+    auto *shadow = new QGraphicsDropShadowEffect(pill);
+    shadow->setBlurRadius(20);
+    shadow->setOffset(0, 4);
     shadow->setColor(QColor(0, 0, 0, 140));
-    button->setGraphicsEffect(shadow);
+    pill->setGraphicsEffect(shadow);
 
-    connect(button, &QPushButton::clicked, this, &StopOverlay::stopRequested);
+    connect(closeBtn, &QPushButton::clicked, this, &StopOverlay::stopRequested);
 
     adjustSize();
     setFixedSize(sizeHint());
 }
 
+void StopOverlay::setProgress(int percent)
+{
+    percentLabel->setText(QStringLiteral("%1%").arg(qBound(0, percent, 100)));
+}
+
 void StopOverlay::appear()
 {
     closing = false;
+    hideNotified = false;
     stopAnimations();
     placeOnScreen(-22);
     setWindowOpacity(0.0);
@@ -121,26 +136,26 @@ void StopOverlay::appear()
 
 void StopOverlay::disappear()
 {
-    if (closing && !isVisible()) {
-        emit hiddenFully();
+    if (closing) {
+        hideFully();
         return;
     }
     closing = true;
     stopAnimations();
     if (!isVisible()) {
-        emit hiddenFully();
+        hideFully();
         return;
     }
 
     auto *group = new QParallelAnimationGroup(this);
     auto *posAnim = new QPropertyAnimation(this, "pos");
-    posAnim->setDuration(220);
+    posAnim->setDuration(180);
     posAnim->setStartValue(pos());
-    posAnim->setEndValue(QPoint(pos().x(), pos().y() - 22));
+    posAnim->setEndValue(QPoint(pos().x(), pos().y() - 18));
     posAnim->setEasingCurve(QEasingCurve::InCubic);
 
     auto *opAnim = new QPropertyAnimation(this, "windowOpacity");
-    opAnim->setDuration(220);
+    opAnim->setDuration(180);
     opAnim->setStartValue(windowOpacity());
     opAnim->setEndValue(0.0);
     opAnim->setEasingCurve(QEasingCurve::InCubic);
@@ -152,15 +167,25 @@ void StopOverlay::disappear()
         if (currentAnim == group)
             currentAnim = nullptr;
         group->deleteLater();
-        hide();
-        emit hiddenFully();
+        hideFully();
     });
     group->start();
+    QTimer::singleShot(220, this, [this]() {
+        if (closing && isVisible())
+            hideFully();
+    });
 }
 
-void StopOverlay::showEvent(QShowEvent *event)
+void StopOverlay::hideFully()
 {
-    QWidget::showEvent(event);
+    stopAnimations();
+    hide();
+    setWindowOpacity(1.0);
+    setProgress(0);
+    if (hideNotified)
+        return;
+    hideNotified = true;
+    emit hiddenFully();
 }
 
 void StopOverlay::placeOnScreen(int yOffset)
@@ -176,7 +201,7 @@ QPoint StopOverlay::restPos() const
         screen = QGuiApplication::primaryScreen();
     const QRect g = screen ? screen->availableGeometry() : QRect(0, 0, 1920, 1080);
     const int x = g.x() + (g.width() - width()) / 2;
-    const int y = g.y() + 100;
+    const int y = g.y() + 50;
     return QPoint(x, y);
 }
 

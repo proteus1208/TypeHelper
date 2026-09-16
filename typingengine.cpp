@@ -159,11 +159,6 @@ int DelayService::rapidBackspace() const
     return uni(42, 88);
 }
 
-int DelayService::settlePause() const
-{
-    return uni(700, 900);
-}
-
 TypingEngine::TypingEngine(QObject *parent)
     : QObject(parent)
     , timer(new QTimer(this))
@@ -174,7 +169,7 @@ TypingEngine::TypingEngine(QObject *parent)
 
 void TypingEngine::start(const QString &text, bool autoIndent)
 {
-    stop();
+    reset();
     actions = buildActions(text, autoIndent);
     if (actions.isEmpty()) {
         emit finished();
@@ -184,21 +179,84 @@ void TypingEngine::start(const QString &text, bool autoIndent)
     delays.reset();
     index = 0;
     phase = Phase::Typing;
-    typosLeft = 0;
-    continueLeft = 0;
-    continueOffset = 0;
-    toDelete = 0;
     running = true;
+    notifyProgress();
     timer->start(qBound(520, delays.forAction(actions.first()), 1400));
 }
 
-void TypingEngine::stop()
+void TypingEngine::pause()
+{
+    running = false;
+    timer->stop();
+    abortTypoCleanup();
+    phase = Phase::Idle;
+}
+
+void TypingEngine::resume()
+{
+    if (running || !canResume())
+        return;
+    phase = Phase::Typing;
+    running = true;
+    notifyProgress();
+    timer->start(qBound(520, delays.forAction(actions[index]), 1400));
+}
+
+void TypingEngine::reset()
 {
     running = false;
     phase = Phase::Idle;
     timer->stop();
     actions.clear();
     index = 0;
+    typosLeft = 0;
+    continueLeft = 0;
+    continueOffset = 0;
+    toDelete = 0;
+}
+
+bool TypingEngine::canResume() const
+{
+    return !running && index >= 0 && index < actions.size();
+}
+
+int TypingEngine::percent() const
+{
+    if (actions.isEmpty())
+        return 0;
+    return qBound(0, (index * 100) / actions.size(), 100);
+}
+
+void TypingEngine::notifyProgress()
+{
+    emit progressChanged(percent());
+}
+
+void TypingEngine::abortTypoCleanup()
+{
+    if (toDelete > 0
+        && (phase == Phase::TypoInsert
+            || phase == Phase::TypoContinue
+            || phase == Phase::TypoRealize
+            || phase == Phase::TypoDelete)) {
+        for (int i = 0; i < toDelete; ++i)
+            sendVk(VK_BACK);
+    }
+    typosLeft = 0;
+    continueLeft = 0;
+    continueOffset = 0;
+    toDelete = 0;
+}
+
+void TypingEngine::finishRun()
+{
+    running = false;
+    phase = Phase::Idle;
+    if (!actions.isEmpty())
+        emit progressChanged(100);
+    actions.clear();
+    index = 0;
+    emit finished();
 }
 
 void TypingEngine::onTick()
@@ -212,9 +270,7 @@ void TypingEngine::onTick()
 
     case Phase::Typing: {
         if (index >= actions.size()) {
-            running = false;
-            phase = Phase::Idle;
-            emit finished();
+            finishRun();
             return;
         }
         if (shouldStartTypo()) {
@@ -229,10 +285,9 @@ void TypingEngine::onTick()
         }
         sendAction(actions[index]);
         ++index;
+        notifyProgress();
         if (index >= actions.size()) {
-            running = false;
-            phase = Phase::Idle;
-            emit finished();
+            finishRun();
             return;
         }
         schedule();
@@ -293,9 +348,7 @@ void TypingEngine::schedule()
         return;
     case Phase::Typing:
         if (index >= actions.size()) {
-            running = false;
-            phase = Phase::Idle;
-            emit finished();
+            finishRun();
             return;
         }
         ms = delays.forAction(actions[index]);

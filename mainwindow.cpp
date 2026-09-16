@@ -5,7 +5,6 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QCloseEvent>
-#include <QCursor>
 #include <QEvent>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -26,8 +25,8 @@ MainWindow::MainWindow(QWidget *parent)
     : QWidget(parent)
 {
     setWindowTitle(QStringLiteral("TypeHelper"));
-    resize(640, 560);
-    setMinimumSize(520, 420);
+    resize(560, 480);
+    setMinimumSize(420, 360);
 
     engine = new TypingEngine(this);
     overlay = new StopOverlay(nullptr);
@@ -41,12 +40,17 @@ MainWindow::MainWindow(QWidget *parent)
     autoIndentBox->setChecked(settings.value(QStringLiteral("autoIndent"), false).toBool());
 
     connect(startBtn, &QPushButton::clicked, this, &MainWindow::onStartClicked);
+    connect(resumeBtn, &QPushButton::clicked, this, &MainWindow::onResumeClicked);
     connect(input, &QPlainTextEdit::textChanged, this, &MainWindow::onTextChanged);
-    connect(autoIndentBox, &QCheckBox::toggled, this, [](bool on) {
+    connect(autoIndentBox, &QCheckBox::toggled, this, [this](bool on) {
         QSettings s(QStringLiteral("TypeHelper"), QStringLiteral("TypeHelper"));
         s.setValue(QStringLiteral("autoIndent"), on);
+        if (!sessionActive)
+            engine->reset();
+        updateActionButtons();
     });
     connect(engine, &TypingEngine::finished, this, &MainWindow::onTypingFinished);
+    connect(engine, &TypingEngine::progressChanged, overlay, &StopOverlay::setProgress);
     connect(overlay, &StopOverlay::stopRequested, this, &MainWindow::requestStop);
     connect(overlay, &StopOverlay::hiddenFully, this, &MainWindow::onOverlayHidden);
     connect(guardTimer, &QTimer::timeout, this, &MainWindow::pollGuards);
@@ -86,15 +90,9 @@ void MainWindow::setupUi()
     auto *title = new QLabel(QStringLiteral("TypeHelper"), this);
     title->setObjectName(QStringLiteral("titleLabel"));
 
-    auto *subtitle = new QLabel(
-        QStringLiteral("Types into the last focused window like a person — word rhythm, pauses, and rare typos."),
-        this);
-    subtitle->setObjectName(QStringLiteral("subtitleLabel"));
-    subtitle->setWordWrap(true);
-
     input = new QPlainTextEdit(this);
     input->setObjectName(QStringLiteral("sourceEdit"));
-    input->setPlaceholderText(QStringLiteral("Paste the text you want typed…"));
+    input->setPlaceholderText(QStringLiteral("Text to type"));
     input->setTabChangesFocus(false);
 
     auto *editorCard = new QFrame(this);
@@ -103,52 +101,44 @@ void MainWindow::setupUi()
     editorLayout->setContentsMargins(10, 10, 10, 10);
     editorLayout->addWidget(input);
 
-    autoIndentBox = new QCheckBox(QStringLiteral("Keep indent on Enter"), this);
+    autoIndentBox = new QCheckBox(QStringLiteral("Keep indent"), this);
     autoIndentBox->setObjectName(QStringLiteral("indentBox"));
-
-    auto *indentHint = new QLabel(
-        QStringLiteral("Turn this on for editors that copy the previous line's indent when you press Enter. "
-                       "Matching indent is skipped; extra Tab/space is sent when indent grows, Backspace when it shrinks."),
-        this);
-    indentHint->setObjectName(QStringLiteral("hintLabel"));
-    indentHint->setWordWrap(true);
 
     countLabel = new QLabel(this);
     countLabel->setObjectName(QStringLiteral("metaLabel"));
 
-    statusLabel = new QLabel(QStringLiteral("Ready"), this);
+    statusLabel = new QLabel(this);
     statusLabel->setObjectName(QStringLiteral("statusLabel"));
 
     auto *metaRow = new QHBoxLayout();
-    metaRow->addWidget(countLabel);
+    metaRow->addWidget(autoIndentBox);
     metaRow->addStretch();
+    metaRow->addWidget(countLabel);
     metaRow->addWidget(statusLabel);
 
-    startBtn = new QPushButton(QStringLiteral("Start auto typing"), this);
+    startBtn = new QPushButton(QStringLiteral("Start"), this);
     startBtn->setObjectName(QStringLiteral("startBtn"));
     startBtn->setCursor(Qt::PointingHandCursor);
-    startBtn->setMinimumHeight(44);
+    startBtn->setMinimumHeight(40);
 
-    auto *stopHint = new QLabel(
-        QStringLiteral("Focus your editor first. Stop with the red button, Esc, a mouse click, or moving the mouse more than 100 px."),
-        this);
-    stopHint->setObjectName(QStringLiteral("hintLabel"));
-    stopHint->setWordWrap(true);
+    resumeBtn = new QPushButton(QStringLiteral("Resume"), this);
+    resumeBtn->setObjectName(QStringLiteral("resumeBtn"));
+    resumeBtn->setCursor(Qt::PointingHandCursor);
+    resumeBtn->setMinimumHeight(40);
+    resumeBtn->setEnabled(false);
+
+    auto *btnRow = new QHBoxLayout();
+    btnRow->setSpacing(10);
+    btnRow->addWidget(startBtn, 1);
+    btnRow->addWidget(resumeBtn, 1);
 
     auto *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(22, 20, 22, 18);
+    layout->setContentsMargins(20, 18, 20, 16);
     layout->setSpacing(10);
     layout->addWidget(title);
-    layout->addWidget(subtitle);
-    layout->addSpacing(4);
     layout->addWidget(editorCard, 1);
     layout->addLayout(metaRow);
-    layout->addSpacing(4);
-    layout->addWidget(autoIndentBox);
-    layout->addWidget(indentHint);
-    layout->addSpacing(8);
-    layout->addWidget(startBtn);
-    layout->addWidget(stopHint);
+    layout->addLayout(btnRow);
 }
 
 void MainWindow::applyTheme()
@@ -156,8 +146,7 @@ void MainWindow::applyTheme()
     setObjectName(QStringLiteral("root"));
     setStyleSheet(QStringLiteral(
         "#root { background-color: #1e1e2e; }"
-        "#titleLabel { color: #cdd6f4; font-size: 22px; font-weight: 700; }"
-        "#subtitleLabel { color: #a6adc8; font-size: 12px; }"
+        "#titleLabel { color: #cdd6f4; font-size: 20px; font-weight: 700; }"
         "#editorCard {"
         "  background-color: #181825;"
         "  border: 1px solid #313244;"
@@ -184,9 +173,8 @@ void MainWindow::applyTheme()
         "  border-radius: 4px;"
         "  background: #89b4fa;"
         "}"
-        "#hintLabel { color: #7f849c; font-size: 11px; }"
         "#metaLabel, #statusLabel { color: #9399b2; font-size: 11px; }"
-        "#statusLabel { font-weight: 600; }"
+        "#statusLabel { font-weight: 600; padding-left: 10px; }"
         "#startBtn {"
         "  background-color: #89b4fa;"
         "  color: #1e1e2e;"
@@ -198,7 +186,61 @@ void MainWindow::applyTheme()
         "}"
         "#startBtn:hover { background-color: #b4befe; }"
         "#startBtn:pressed { background-color: #74c7ec; }"
-        "#startBtn:disabled { background-color: #45475a; color: #6c7086; }"));
+        "#startBtn:disabled { background-color: #45475a; color: #6c7086; }"
+        "#resumeBtn {"
+        "  background-color: #313244;"
+        "  color: #cdd6f4;"
+        "  border: none;"
+        "  border-radius: 10px;"
+        "  font-size: 14px;"
+        "  font-weight: 700;"
+        "  padding: 10px 16px;"
+        "}"
+        "#resumeBtn:hover { background-color: #45475a; }"
+        "#resumeBtn:pressed { background-color: #585b70; }"
+        "#resumeBtn:disabled { background-color: #181825; color: #585b70; }"
+        "QScrollBar:vertical {"
+        "  background: transparent;"
+        "  width: 10px;"
+        "  margin: 6px 3px 6px 0;"
+        "  border: none;"
+        "}"
+        "QScrollBar::handle:vertical {"
+        "  background: #45475a;"
+        "  border: none;"
+        "  border-radius: 5px;"
+        "  min-height: 32px;"
+        "}"
+        "QScrollBar::handle:vertical:hover { background: #6c7086; }"
+        "QScrollBar::handle:vertical:pressed { background: #89b4fa; }"
+        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+        "  height: 0;"
+        "  width: 0;"
+        "  border: none;"
+        "  background: none;"
+        "}"
+        "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }"
+        "QScrollBar:horizontal {"
+        "  background: transparent;"
+        "  height: 10px;"
+        "  margin: 0 6px 3px 6px;"
+        "  border: none;"
+        "}"
+        "QScrollBar::handle:horizontal {"
+        "  background: #45475a;"
+        "  border: none;"
+        "  border-radius: 5px;"
+        "  min-width: 32px;"
+        "}"
+        "QScrollBar::handle:horizontal:hover { background: #6c7086; }"
+        "QScrollBar::handle:horizontal:pressed { background: #89b4fa; }"
+        "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {"
+        "  height: 0;"
+        "  width: 0;"
+        "  border: none;"
+        "  background: none;"
+        "}"
+        "QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }"));
 }
 
 void MainWindow::onStartClicked()
@@ -207,7 +249,14 @@ void MainWindow::onStartClicked()
         return;
     if (input->toPlainText().isEmpty())
         return;
-    beginSession();
+    beginSession(false);
+}
+
+void MainWindow::onResumeClicked()
+{
+    if (sessionActive || !engine->canResume())
+        return;
+    beginSession(true);
 }
 
 void MainWindow::onTypingFinished()
@@ -227,7 +276,13 @@ void MainWindow::onOverlayHidden()
     showNormal();
     raise();
     activateWindow();
-    statusLabel->setText(completedRun ? QStringLiteral("Done") : QStringLiteral("Stopped"));
+    if (completedRun)
+        statusLabel->setText(QStringLiteral("Done"));
+    else if (engine->canResume())
+        statusLabel->setText(QStringLiteral("Paused"));
+    else
+        statusLabel->clear();
+    updateActionButtons();
 }
 
 void MainWindow::changeEvent(QEvent *event)
@@ -250,16 +305,6 @@ void MainWindow::pollGuards()
     if (!sessionActive)
         return;
 
-    POINT pt{};
-    if (GetCursorPos(&pt)) {
-        const int dx = pt.x - originPos.x();
-        const int dy = pt.y - originPos.y();
-        if (dx * dx + dy * dy > 100 * 100) {
-            requestStop();
-            return;
-        }
-    }
-
     const bool left = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     const bool right = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
     const bool middle = (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
@@ -275,31 +320,31 @@ void MainWindow::pollGuards()
 
 void MainWindow::onTextChanged()
 {
+    if (!sessionActive && engine->canResume() && input->toPlainText() != sessionText)
+        engine->reset();
     updateCounts();
-    startBtn->setEnabled(!input->toPlainText().isEmpty() && !sessionActive);
+    updateActionButtons();
 }
 
-void MainWindow::beginSession()
+void MainWindow::beginSession(bool resume)
 {
     endingSession = false;
     completedRun = false;
     clickArmed = false;
-    startBtn->setEnabled(false);
-    statusLabel->setText(QStringLiteral("Typing…"));
-
-    POINT pt{};
-    if (GetCursorPos(&pt))
-        originPos = QPoint(pt.x, pt.y);
-    else
-        originPos = QCursor::pos();
+    sessionText = input->toPlainText();
+    statusLabel->setText(QStringLiteral("Typing"));
 
     showMinimized();
 
     sessionActive = true;
+    updateActionButtons();
     overlay->appear();
     registerEscHotkey(true);
     guardTimer->start();
-    engine->start(input->toPlainText(), autoIndentBox->isChecked());
+    if (resume)
+        engine->resume();
+    else
+        engine->start(sessionText, autoIndentBox->isChecked());
 }
 
 void MainWindow::endSession(bool completed)
@@ -310,11 +355,15 @@ void MainWindow::endSession(bool completed)
     sessionActive = false;
     completedRun = completed;
 
-    engine->stop();
+    if (completed)
+        engine->reset();
+    else
+        engine->pause();
+
     guardTimer->stop();
     registerEscHotkey(false);
-    startBtn->setEnabled(!input->toPlainText().isEmpty());
     overlay->disappear();
+    updateActionButtons();
 }
 
 void MainWindow::registerEscHotkey(bool enable)
@@ -332,5 +381,12 @@ void MainWindow::updateCounts()
     int lines = text.isEmpty() ? 0 : text.count(QLatin1Char('\n')) + 1;
     if (text.isEmpty())
         lines = 0;
-    countLabel->setText(QStringLiteral("%1 characters  ·  %2 lines").arg(text.size()).arg(lines));
+    countLabel->setText(QStringLiteral("%1 · %2").arg(text.size()).arg(lines));
+}
+
+void MainWindow::updateActionButtons()
+{
+    const bool hasText = !input->toPlainText().isEmpty();
+    startBtn->setEnabled(hasText && !sessionActive);
+    resumeBtn->setEnabled(!sessionActive && engine->canResume());
 }

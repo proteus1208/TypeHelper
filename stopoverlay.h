@@ -4,6 +4,7 @@
 #include <QWidget>
 #include <QPoint>
 
+class QLabel;
 class QParallelAnimationGroup;
 class QPushButton;
 
@@ -15,22 +16,23 @@ public:
 
     void appear();
     void disappear();
+    void setProgress(int percent);
 
 signals:
     void stopRequested();
     void hiddenFully();
 
-protected:
-    void showEvent(QShowEvent *event) override;
-
 private:
     void placeOnScreen(int yOffset);
     QPoint restPos() const;
     void stopAnimations();
+    void hideFully();
 
-    QPushButton *button = nullptr;
+    QLabel *percentLabel = nullptr;
+    QPushButton *closeBtn = nullptr;
     QParallelAnimationGroup *currentAnim = nullptr;
     bool closing = false;
+    bool hideNotified = false;
 };
 
 #endif // STOPOVERLAY_H

@@ -3,7 +3,6 @@
 
 #include <QWidget>
 #include <QAbstractNativeEventFilter>
-#include <QPoint>
 
 class QCheckBox;
 class QCloseEvent;
@@ -30,6 +29,7 @@ protected:
 
 private slots:
     void onStartClicked();
+    void onResumeClicked();
     void onTypingFinished();
     void requestStop();
     void onOverlayHidden();
@@ -39,13 +39,15 @@ private slots:
 private:
     void setupUi();
     void applyTheme();
-    void beginSession();
+    void beginSession(bool resume);
     void endSession(bool completed);
     void registerEscHotkey(bool enable);
     void updateCounts();
+    void updateActionButtons();
 
     QPlainTextEdit *input = nullptr;
     QPushButton *startBtn = nullptr;
+    QPushButton *resumeBtn = nullptr;
     QCheckBox *autoIndentBox = nullptr;
     QLabel *countLabel = nullptr;
     QLabel *statusLabel = nullptr;
@@ -57,7 +59,7 @@ private:
     bool endingSession = false;
     bool clickArmed = false;
     bool completedRun = false;
-    QPoint originPos;
+    QString sessionText;
     static constexpr int kEscHotkeyId = 1;
 };
 

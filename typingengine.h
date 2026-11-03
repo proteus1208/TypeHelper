@@ -23,12 +23,16 @@ class DelayService
 {
 public:
     void reset();
+    void setWpm(int wpm);
+    int wpm() const { return targetWpm; }
     int forAction(const TypeAction &action);
     int forWrongKey();
     int realizePause() const;
     int rapidBackspace() const;
 
 private:
+    int scaled(int ms) const;
+    int targetWpm = 45;
     int wordBaseMs = 70;
     bool inWord = false;
 };
@@ -43,6 +47,7 @@ public:
     void pause();
     void resume();
     void reset();
+    void setWpm(int wpm);
     bool isRunning() const { return running; }
     bool canResume() const;
     int currentIndex() const { return index; }
@@ -68,8 +73,11 @@ private:
     void abortTypoCleanup();
     void finishRun();
     void notifyProgress();
+    void captureTargetWindow();
     void sendAction(const TypeAction &action);
     void sendWrongKey();
+    void sendChar(QChar ch);
+    void sendVirtualKey(quint16 vk);
     bool shouldStartTypo() const;
     void beginTypo();
     bool isTypeableChar(const TypeAction &action) const;
@@ -87,6 +95,8 @@ private:
     int continueOffset = 0;
     int toDelete = 0;
     bool running = false;
+    bool needCapture = false;
+    void *targetRoot = nullptr;
 };
 
 #endif // TYPINGENGINE_H

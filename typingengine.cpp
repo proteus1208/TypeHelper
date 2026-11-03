@@ -31,7 +31,142 @@ QString leadingWhitespace(const QString &line)
     return line.left(i);
 }
 
-void sendUnicode(ushort code)
+bool isExtendedKey(WORD vk)
+{
+    switch (vk) {
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_HOME:
+    case VK_END:
+    case VK_PRIOR:
+    case VK_NEXT:
+    case VK_LEFT:
+    case VK_RIGHT:
+    case VK_UP:
+    case VK_DOWN:
+    case VK_NUMLOCK:
+    case VK_DIVIDE:
+    case VK_RCONTROL:
+    case VK_RMENU:
+        return true;
+    default:
+        return false;
+    }
+}
+
+WORD scanOf(WORD vk)
+{
+    return static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+}
+
+LPARAM keyLParam(WORD vk, bool down)
+{
+    const WORD scan = scanOf(vk);
+    LPARAM lp = 1 | (static_cast<LPARAM>(scan) << 16);
+    if (isExtendedKey(vk))
+        lp |= (1L << 24);
+    if (!down)
+        lp |= (1L << 30) | (1L << 31);
+    return lp;
+}
+
+HWND focusedControl(HWND root)
+{
+    if (!root || !IsWindow(root))
+        return nullptr;
+
+    GUITHREADINFO info{};
+    info.cbSize = sizeof(info);
+    const DWORD tid = GetWindowThreadProcessId(root, nullptr);
+    if (tid && GetGUIThreadInfo(tid, &info)) {
+        if (info.hwndFocus && IsWindow(info.hwndFocus))
+            return info.hwndFocus;
+        if (info.hwndActive && IsWindow(info.hwndActive))
+            return info.hwndActive;
+    }
+    return root;
+}
+
+bool isOwnedByCurrentProcess(HWND hwnd)
+{
+    if (!hwnd)
+        return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+HWND nextForeignWindow(HWND start)
+{
+    HWND w = start;
+    while (w) {
+        w = GetWindow(w, GW_HWNDNEXT);
+        if (!w)
+            break;
+        if (!IsWindowVisible(w) || !IsWindowEnabled(w))
+            continue;
+        if (GetWindow(w, GW_OWNER))
+            continue;
+        if (isOwnedByCurrentProcess(w))
+            continue;
+        const LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        if (ex & WS_EX_TOOLWINDOW)
+            continue;
+        HWND root = GetAncestor(w, GA_ROOT);
+        return root ? root : w;
+    }
+    return nullptr;
+}
+
+HWND captureForegroundTarget()
+{
+    HWND fg = GetForegroundWindow();
+    if (fg && !isOwnedByCurrentProcess(fg)) {
+        HWND root = GetAncestor(fg, GA_ROOT);
+        return root ? root : fg;
+    }
+    HWND foreign = nextForeignWindow(fg);
+    if (foreign)
+        return foreign;
+    return fg;
+}
+
+bool windowIsUnder(HWND hwnd, HWND root)
+{
+    while (hwnd) {
+        if (hwnd == root)
+            return true;
+        hwnd = GetParent(hwnd);
+    }
+    return false;
+}
+
+bool targetIsForeground(HWND root)
+{
+    if (!root || !IsWindow(root))
+        return false;
+    HWND fg = GetForegroundWindow();
+    if (!fg)
+        return false;
+    if (fg == root || windowIsUnder(fg, root))
+        return true;
+    HWND fgRoot = GetAncestor(fg, GA_ROOT);
+    return fgRoot && fgRoot == root;
+}
+
+void sendInputKey(WORD vk, bool down)
+{
+    INPUT ip{};
+    ip.type = INPUT_KEYBOARD;
+    ip.ki.wVk = vk;
+    ip.ki.wScan = scanOf(vk);
+    ip.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    if (isExtendedKey(vk))
+        ip.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    SendInput(1, &ip, sizeof(INPUT));
+}
+
+void sendInputUnicode(ushort code)
 {
     INPUT ip[2]{};
     ip[0].type = INPUT_KEYBOARD;
@@ -42,14 +177,83 @@ void sendUnicode(ushort code)
     SendInput(2, ip, sizeof(INPUT));
 }
 
-void sendVk(WORD vk)
+void postKey(HWND hwnd, WORD vk, bool down)
 {
-    INPUT ip[2]{};
-    ip[0].type = INPUT_KEYBOARD;
-    ip[0].ki.wVk = vk;
-    ip[1] = ip[0];
-    ip[1].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(2, ip, sizeof(INPUT));
+    const UINT msg = down ? WM_KEYDOWN : WM_KEYUP;
+    PostMessageW(hwnd, msg, vk, keyLParam(vk, down));
+}
+
+void deliverCharMessage(HWND hwnd, ushort code)
+{
+    DWORD_PTR dummy = 0;
+    if (!SendMessageTimeoutW(hwnd, WM_CHAR, code, 1,
+                             SMTO_ABORTIFHUNG | SMTO_NORMAL, 40, &dummy)) {
+        PostMessageW(hwnd, WM_CHAR, code, 1);
+    }
+}
+
+void sendPhysicalCharForeground(QChar ch)
+{
+    const SHORT mapped = VkKeyScanW(ch.unicode());
+    if (mapped == -1) {
+        sendInputUnicode(ch.unicode());
+        return;
+    }
+
+    const WORD vk = LOBYTE(mapped);
+    const BYTE mods = HIBYTE(mapped);
+    bool shift = (mods & 1) != 0;
+    const bool ctrl = (mods & 2) != 0;
+    const bool alt = (mods & 4) != 0;
+
+    if (vk >= 'A' && vk <= 'Z' && (GetKeyState(VK_CAPITAL) & 1))
+        shift = !shift;
+
+    if (shift)
+        sendInputKey(VK_LSHIFT, true);
+    if (ctrl)
+        sendInputKey(VK_LCONTROL, true);
+    if (alt)
+        sendInputKey(VK_LMENU, true);
+
+    sendInputKey(vk, true);
+    sendInputKey(vk, false);
+
+    if (alt)
+        sendInputKey(VK_LMENU, false);
+    if (ctrl)
+        sendInputKey(VK_LCONTROL, false);
+    if (shift)
+        sendInputKey(VK_LSHIFT, false);
+}
+
+void sendPhysicalCharBackground(HWND hwnd, QChar ch)
+{
+    const SHORT mapped = VkKeyScanW(ch.unicode());
+    if (mapped != -1) {
+        const WORD vk = LOBYTE(mapped);
+        postKey(hwnd, vk, true);
+        postKey(hwnd, vk, false);
+    }
+    deliverCharMessage(hwnd, ch.unicode());
+}
+
+void sendVirtualForeground(WORD vk)
+{
+    sendInputKey(vk, true);
+    sendInputKey(vk, false);
+}
+
+void sendVirtualBackground(HWND hwnd, WORD vk)
+{
+    postKey(hwnd, vk, true);
+    if (vk == VK_RETURN)
+        deliverCharMessage(hwnd, '\r');
+    else if (vk == VK_TAB)
+        deliverCharMessage(hwnd, '\t');
+    else if (vk == VK_BACK)
+        PostMessageW(hwnd, WM_CHAR, VK_BACK, keyLParam(vk, true));
+    postKey(hwnd, vk, false);
 }
 
 enum class CharKind {
@@ -100,6 +304,17 @@ void DelayService::reset()
     inWord = false;
 }
 
+void DelayService::setWpm(int wpm)
+{
+    targetWpm = qBound(15, wpm, 120);
+}
+
+int DelayService::scaled(int ms) const
+{
+    const double factor = 45.0 / double(qBound(15, targetWpm, 120));
+    return clampMs(int(ms * factor + 0.5), 8, 20000);
+}
+
 int DelayService::forAction(const TypeAction &action)
 {
     const CharKind kind = kindOf(action);
@@ -107,7 +322,7 @@ int DelayService::forAction(const TypeAction &action)
     if (kind != CharKind::Lower && kind != CharKind::Upper)
         inWord = false;
 
-    // Rare long pause — thinking about the next keystroke.
+    // Rare long pause — thinking about the next keystroke. Not scaled with WPM.
     if (kind != CharKind::Backspace && chance(3))
         return uni(5000, 10000);
 
@@ -117,46 +332,46 @@ int DelayService::forAction(const TypeAction &action)
             wordBaseMs = uni(52, 90);
             inWord = true;
         }
-        return clampMs(wordBaseMs + uni(-14, 18), 38, 120);
+        return scaled(clampMs(wordBaseMs + uni(-14, 18), 38, 120));
     }
     case CharKind::Upper:
         inWord = true;
-        return uni(95, 180);
+        return scaled(uni(95, 180));
     case CharKind::Digit:
-        return uni(80, 165);
+        return scaled(uni(80, 165));
     case CharKind::Special:
-        return uni(160, 380);
+        return scaled(uni(160, 380));
     case CharKind::Period:
         if (chance(80))
             return uni(5000, 10000);
-        return uni(480, 1400);
+        return scaled(uni(480, 1400));
     case CharKind::Space:
-        return uni(90, 220);
+        return scaled(uni(90, 220));
     case CharKind::Tab:
-        return uni(250, 600);
+        return scaled(uni(250, 600));
     case CharKind::Enter:
         if (chance(45))
             return uni(5000, 10000);
-        return uni(380, 1100);
+        return scaled(uni(380, 1100));
     case CharKind::Backspace:
-        return uni(70, 140);
+        return scaled(uni(70, 140));
     }
-    return uni(80, 140);
+    return scaled(uni(80, 140));
 }
 
 int DelayService::forWrongKey()
 {
-    return uni(55, 130);
+    return scaled(uni(55, 130));
 }
 
 int DelayService::realizePause() const
 {
-    return uni(280, 720);
+    return scaled(uni(280, 720));
 }
 
 int DelayService::rapidBackspace() const
 {
-    return uni(42, 88);
+    return scaled(uni(42, 88));
 }
 
 TypingEngine::TypingEngine(QObject *parent)
@@ -165,6 +380,11 @@ TypingEngine::TypingEngine(QObject *parent)
 {
     timer->setSingleShot(true);
     connect(timer, &QTimer::timeout, this, &TypingEngine::onTick);
+}
+
+void TypingEngine::setWpm(int wpm)
+{
+    delays.setWpm(wpm);
 }
 
 void TypingEngine::start(const QString &text, bool autoIndent)
@@ -180,6 +400,7 @@ void TypingEngine::start(const QString &text, bool autoIndent)
     index = 0;
     phase = Phase::Typing;
     running = true;
+    needCapture = true;
     notifyProgress();
     timer->start(qBound(520, delays.forAction(actions.first()), 1400));
 }
@@ -198,6 +419,7 @@ void TypingEngine::resume()
         return;
     phase = Phase::Typing;
     running = true;
+    needCapture = true;
     notifyProgress();
     timer->start(qBound(520, delays.forAction(actions[index]), 1400));
 }
@@ -213,6 +435,8 @@ void TypingEngine::reset()
     continueLeft = 0;
     continueOffset = 0;
     toDelete = 0;
+    needCapture = false;
+    targetRoot = nullptr;
 }
 
 bool TypingEngine::canResume() const
@@ -232,6 +456,13 @@ void TypingEngine::notifyProgress()
     emit progressChanged(percent());
 }
 
+void TypingEngine::captureTargetWindow()
+{
+#ifdef Q_OS_WIN
+    targetRoot = static_cast<void *>(captureForegroundTarget());
+#endif
+}
+
 void TypingEngine::abortTypoCleanup()
 {
     if (toDelete > 0
@@ -240,7 +471,7 @@ void TypingEngine::abortTypoCleanup()
             || phase == Phase::TypoRealize
             || phase == Phase::TypoDelete)) {
         for (int i = 0; i < toDelete; ++i)
-            sendVk(VK_BACK);
+            sendVirtualKey(VK_BACK);
     }
     typosLeft = 0;
     continueLeft = 0;
@@ -263,6 +494,11 @@ void TypingEngine::onTick()
 {
     if (!running)
         return;
+
+    if (needCapture) {
+        captureTargetWindow();
+        needCapture = false;
+    }
 
     switch (phase) {
     case Phase::Idle:
@@ -326,7 +562,7 @@ void TypingEngine::onTick()
         return;
 
     case Phase::TypoDelete:
-        sendVk(VK_BACK);
+        sendVirtualKey(VK_BACK);
         --toDelete;
         if (toDelete <= 0) {
             continueOffset = 0;
@@ -378,21 +614,60 @@ void TypingEngine::sendAction(const TypeAction &action)
 {
     switch (action.kind) {
     case ActionKind::Enter:
-        sendVk(VK_RETURN);
+        sendVirtualKey(VK_RETURN);
         break;
     case ActionKind::Tab:
-        sendVk(VK_TAB);
+        sendVirtualKey(VK_TAB);
         break;
     case ActionKind::Backspace:
-        sendVk(VK_BACK);
+        sendVirtualKey(VK_BACK);
         break;
     case ActionKind::Char:
         if (action.ch == QLatin1Char('\t'))
-            sendVk(VK_TAB);
+            sendVirtualKey(VK_TAB);
         else
-            sendUnicode(action.ch.unicode());
+            sendChar(action.ch);
         break;
     }
+}
+
+void TypingEngine::sendChar(QChar ch)
+{
+#ifdef Q_OS_WIN
+    HWND root = static_cast<HWND>(targetRoot);
+    if (root && IsWindow(root) && targetIsForeground(root)) {
+        sendPhysicalCharForeground(ch);
+        return;
+    }
+    HWND hwnd = focusedControl(root);
+    if (hwnd && !isOwnedByCurrentProcess(hwnd)) {
+        sendPhysicalCharBackground(hwnd, ch);
+        return;
+    }
+    sendPhysicalCharForeground(ch);
+#else
+    Q_UNUSED(ch);
+#endif
+}
+
+void TypingEngine::sendVirtualKey(quint16 vk)
+{
+#ifdef Q_OS_WIN
+    const WORD key = static_cast<WORD>(vk);
+    HWND root = static_cast<HWND>(targetRoot);
+    if (root && IsWindow(root) && targetIsForeground(root)) {
+        sendVirtualForeground(key);
+        return;
+    }
+    HWND hwnd = focusedControl(root);
+    if (hwnd && !isOwnedByCurrentProcess(hwnd)) {
+        sendVirtualBackground(hwnd, key);
+        return;
+    }
+    sendVirtualForeground(key);
+#else
+    Q_UNUSED(vk);
+#endif
 }
 
 void TypingEngine::sendWrongKey()
@@ -400,7 +675,7 @@ void TypingEngine::sendWrongKey()
     QChar seed = QLatin1Char('a');
     if (index < actions.size() && actions[index].kind == ActionKind::Char)
         seed = actions[index].ch;
-    sendUnicode(neighborOf(seed).unicode());
+    sendChar(neighborOf(seed));
 }
 
 bool TypingEngine::shouldStartTypo() const

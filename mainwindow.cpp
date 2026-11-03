@@ -2,46 +2,41 @@
 #include "stopoverlay.h"
 #include "typingengine.h"
 
-#include <QApplication>
 #include <QCheckBox>
 #include <QCloseEvent>
-#include <QEvent>
-#include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSettings>
-#include <QTimer>
+#include <QSlider>
+#include <QFrame>
 #include <QVBoxLayout>
-
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
 
 MainWindow::MainWindow(QWidget *parent)
     : QWidget(parent)
 {
     setWindowTitle(QStringLiteral("TypeHelper"));
-    resize(560, 480);
-    setMinimumSize(420, 360);
+    resize(560, 520);
+    setMinimumSize(420, 400);
 
     engine = new TypingEngine(this);
     overlay = new StopOverlay(nullptr);
-    guardTimer = new QTimer(this);
-    guardTimer->setInterval(40);
 
     setupUi();
     applyTheme();
 
     QSettings settings(QStringLiteral("TypeHelper"), QStringLiteral("TypeHelper"));
     autoIndentBox->setChecked(settings.value(QStringLiteral("autoIndent"), false).toBool());
+    const int wpm = qBound(15, settings.value(QStringLiteral("wpm"), 45).toInt(), 120);
+    speedSlider->setValue(wpm);
+    engine->setWpm(wpm);
+    updateSpeedLabel(wpm);
 
     connect(startBtn, &QPushButton::clicked, this, &MainWindow::onStartClicked);
     connect(resumeBtn, &QPushButton::clicked, this, &MainWindow::onResumeClicked);
     connect(input, &QPlainTextEdit::textChanged, this, &MainWindow::onTextChanged);
+    connect(speedSlider, &QSlider::valueChanged, this, &MainWindow::onSpeedChanged);
     connect(autoIndentBox, &QCheckBox::toggled, this, [this](bool on) {
         QSettings s(QStringLiteral("TypeHelper"), QStringLiteral("TypeHelper"));
         s.setValue(QStringLiteral("autoIndent"), on);
@@ -53,36 +48,17 @@ MainWindow::MainWindow(QWidget *parent)
     connect(engine, &TypingEngine::progressChanged, overlay, &StopOverlay::setProgress);
     connect(overlay, &StopOverlay::stopRequested, this, &MainWindow::requestStop);
     connect(overlay, &StopOverlay::hiddenFully, this, &MainWindow::onOverlayHidden);
-    connect(guardTimer, &QTimer::timeout, this, &MainWindow::pollGuards);
 
-    qApp->installNativeEventFilter(this);
     onTextChanged();
 }
 
 MainWindow::~MainWindow()
 {
-    qApp->removeNativeEventFilter(this);
-    registerEscHotkey(false);
     if (overlay) {
         overlay->hide();
         overlay->deleteLater();
         overlay = nullptr;
     }
-}
-
-bool MainWindow::nativeEventFilter(const QByteArray &eventType, void *message, qintptr *result)
-{
-    Q_UNUSED(result);
-    if (!sessionActive)
-        return false;
-    if (eventType != "windows_generic_MSG" && eventType != "windows_dispatcher_MSG")
-        return false;
-    const MSG *msg = static_cast<MSG *>(message);
-    if (msg && msg->message == WM_HOTKEY && static_cast<int>(msg->wParam) == kEscHotkeyId) {
-        requestStop();
-        return true;
-    }
-    return false;
 }
 
 void MainWindow::setupUi()
@@ -116,6 +92,32 @@ void MainWindow::setupUi()
     metaRow->addWidget(countLabel);
     metaRow->addWidget(statusLabel);
 
+    auto *speedName = new QLabel(QStringLiteral("Speed"), this);
+    speedName->setObjectName(QStringLiteral("metaLabel"));
+
+    speedSlider = new QSlider(Qt::Horizontal, this);
+    speedSlider->setObjectName(QStringLiteral("speedSlider"));
+    speedSlider->setRange(15, 120);
+    speedSlider->setValue(45);
+    speedSlider->setTickPosition(QSlider::TicksBelow);
+    speedSlider->setTickInterval(15);
+    speedSlider->setPageStep(5);
+    speedSlider->setSingleStep(1);
+
+    speedValueLabel = new QLabel(this);
+    speedValueLabel->setObjectName(QStringLiteral("speedValueLabel"));
+    speedValueLabel->setMinimumWidth(64);
+    speedValueLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    auto *speedRow = new QHBoxLayout();
+    speedRow->setSpacing(10);
+    speedRow->addWidget(speedName);
+    speedRow->addWidget(speedSlider, 1);
+    speedRow->addWidget(speedValueLabel);
+
+    auto *speedHint = new QLabel(QStringLiteral("Typical human typing speed is about 45 WPM"), this);
+    speedHint->setObjectName(QStringLiteral("hintLabel"));
+
     startBtn = new QPushButton(QStringLiteral("Start"), this);
     startBtn->setObjectName(QStringLiteral("startBtn"));
     startBtn->setCursor(Qt::PointingHandCursor);
@@ -138,6 +140,8 @@ void MainWindow::setupUi()
     layout->addWidget(title);
     layout->addWidget(editorCard, 1);
     layout->addLayout(metaRow);
+    layout->addLayout(speedRow);
+    layout->addWidget(speedHint);
     layout->addLayout(btnRow);
 }
 
@@ -173,8 +177,29 @@ void MainWindow::applyTheme()
         "  border-radius: 4px;"
         "  background: #89b4fa;"
         "}"
-        "#metaLabel, #statusLabel { color: #9399b2; font-size: 11px; }"
+        "#metaLabel, #statusLabel, #hintLabel { color: #9399b2; font-size: 11px; }"
+        "#speedValueLabel { color: #cdd6f4; font-size: 12px; font-weight: 700; }"
         "#statusLabel { font-weight: 600; padding-left: 10px; }"
+        "#speedSlider { min-height: 22px; }"
+        "#speedSlider::groove:horizontal {"
+        "  height: 6px;"
+        "  background: #313244;"
+        "  border-radius: 3px;"
+        "}"
+        "#speedSlider::sub-page:horizontal {"
+        "  height: 6px;"
+        "  background: #89b4fa;"
+        "  border-radius: 3px;"
+        "}"
+        "#speedSlider::handle:horizontal {"
+        "  width: 16px;"
+        "  height: 16px;"
+        "  margin: -6px 0;"
+        "  background: #cdd6f4;"
+        "  border-radius: 8px;"
+        "}"
+        "#speedSlider::handle:horizontal:hover { background: #b4befe; }"
+        "#speedSlider::tick-mark:horizontal { color: #6c7086; }"
         "#startBtn {"
         "  background-color: #89b4fa;"
         "  color: #1e1e2e;"
@@ -285,37 +310,11 @@ void MainWindow::onOverlayHidden()
     updateActionButtons();
 }
 
-void MainWindow::changeEvent(QEvent *event)
-{
-    QWidget::changeEvent(event);
-    if (event->type() == QEvent::WindowStateChange && sessionActive && !isMinimized())
-        requestStop();
-}
-
 void MainWindow::closeEvent(QCloseEvent *event)
 {
     if (sessionActive)
         endSession(false);
-    registerEscHotkey(false);
     event->accept();
-}
-
-void MainWindow::pollGuards()
-{
-    if (!sessionActive)
-        return;
-
-    const bool left = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-    const bool right = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-    const bool middle = (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
-
-    if (!clickArmed) {
-        if (!left && !right && !middle)
-            clickArmed = true;
-        return;
-    }
-    if (left || right || middle)
-        requestStop();
 }
 
 void MainWindow::onTextChanged()
@@ -326,11 +325,26 @@ void MainWindow::onTextChanged()
     updateActionButtons();
 }
 
+void MainWindow::onSpeedChanged(int wpm)
+{
+    engine->setWpm(wpm);
+    updateSpeedLabel(wpm);
+    QSettings settings(QStringLiteral("TypeHelper"), QStringLiteral("TypeHelper"));
+    settings.setValue(QStringLiteral("wpm"), wpm);
+}
+
+void MainWindow::updateSpeedLabel(int wpm)
+{
+    if (wpm == 45)
+        speedValueLabel->setText(QStringLiteral("%1 WPM  avg").arg(wpm));
+    else
+        speedValueLabel->setText(QStringLiteral("%1 WPM").arg(wpm));
+}
+
 void MainWindow::beginSession(bool resume)
 {
     endingSession = false;
     completedRun = false;
-    clickArmed = false;
     sessionText = input->toPlainText();
     statusLabel->setText(QStringLiteral("Typing"));
 
@@ -339,8 +353,6 @@ void MainWindow::beginSession(bool resume)
     sessionActive = true;
     updateActionButtons();
     overlay->appear();
-    registerEscHotkey(true);
-    guardTimer->start();
     if (resume)
         engine->resume();
     else
@@ -360,19 +372,8 @@ void MainWindow::endSession(bool completed)
     else
         engine->pause();
 
-    guardTimer->stop();
-    registerEscHotkey(false);
     overlay->disappear();
     updateActionButtons();
-}
-
-void MainWindow::registerEscHotkey(bool enable)
-{
-    const HWND hwnd = reinterpret_cast<HWND>(winId());
-    if (enable)
-        RegisterHotKey(hwnd, kEscHotkeyId, 0, VK_ESCAPE);
-    else
-        UnregisterHotKey(hwnd, kEscHotkeyId);
 }
 
 void MainWindow::updateCounts()

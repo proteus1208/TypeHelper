@@ -533,6 +533,74 @@ void sendPhysicalCharForeground(QChar ch)
     }
 }
 
+HWND destinationWindow(HWND root, HWND storedControl)
+{
+    HWND dest = focusedControl(root);
+    if (dest && IsWindow(dest) && !isOwnedByCurrentProcess(dest))
+        return dest;
+    dest = resolveControl(root, storedControl);
+    if (dest && IsWindow(dest) && !isOwnedByCurrentProcess(dest))
+        return dest;
+    return (root && IsWindow(root)) ? root : nullptr;
+}
+
+void sendKeyToWindow(HWND hwnd, WORD vk, WORD scan, bool down, bool extended)
+{
+    if (!hwnd || !IsWindow(hwnd))
+        return;
+    LPARAM lp = 1 | (static_cast<LPARAM>(scan ? scan : scanOf(vk)) << 16);
+    if (extended)
+        lp |= (1L << 24);
+    if (!down)
+        lp |= (1L << 30) | (1L << 31);
+    const UINT msg = down ? WM_KEYDOWN : WM_KEYUP;
+    DWORD_PTR dummy = 0;
+    SendMessageTimeoutW(hwnd, msg, vk, lp, SMTO_ABORTIFHUNG | SMTO_NORMAL, 40, &dummy);
+}
+
+void sendCharToWindow(HWND hwnd, QChar ch)
+{
+    if (!hwnd || !IsWindow(hwnd))
+        return;
+
+    const SHORT mapped = VkKeyScanW(ch.unicode());
+    if (mapped == -1) {
+        DWORD_PTR dummy = 0;
+        SendMessageTimeoutW(hwnd, WM_CHAR, ch.unicode(), 1,
+                            SMTO_ABORTIFHUNG | SMTO_NORMAL, 40, &dummy);
+        return;
+    }
+
+    const WORD vk = LOBYTE(mapped);
+    const BYTE mods = HIBYTE(mapped);
+    const bool shift = ch.isUpper() || ((mods & 1) != 0 && !ch.isLetter());
+    const bool ctrl = (mods & 2) != 0;
+    const bool alt = (mods & 4) != 0;
+    const WORD scan = scanOf(vk);
+    const bool extended = isExtendedKey(vk);
+
+    if (shift) {
+        sendKeyToWindow(hwnd, VK_SHIFT, 0x2A, true, false);
+        sendKeyToWindow(hwnd, VK_LSHIFT, 0x2A, true, false);
+    }
+    if (ctrl)
+        sendKeyToWindow(hwnd, VK_LCONTROL, 0x1D, true, false);
+    if (alt)
+        sendKeyToWindow(hwnd, VK_LMENU, 0x38, true, true);
+
+    sendKeyToWindow(hwnd, vk, scan, true, extended);
+    sendKeyToWindow(hwnd, vk, scan, false, extended);
+
+    if (alt)
+        sendKeyToWindow(hwnd, VK_LMENU, 0x38, false, true);
+    if (ctrl)
+        sendKeyToWindow(hwnd, VK_LCONTROL, 0x1D, false, false);
+    if (shift) {
+        sendKeyToWindow(hwnd, VK_LSHIFT, 0x2A, false, false);
+        sendKeyToWindow(hwnd, VK_SHIFT, 0x2A, false, false);
+    }
+}
+
 void sendVirtualForeground(WORD vk)
 {
     sendInputKey(vk, true);
@@ -967,6 +1035,19 @@ void TypingEngine::sendAction(const TypeAction &action)
 void TypingEngine::sendChar(QChar ch)
 {
 #ifdef Q_OS_WIN
+    HWND root = static_cast<HWND>(targetRoot);
+    HWND hwnd = destinationWindow(root, static_cast<HWND>(targetControl));
+    if (root && IsWindow(root) && targetIsForeground(root)) {
+        sendPhysicalCharForeground(ch);
+        return;
+    }
+    if (hwnd && !isOwnedByCurrentProcess(hwnd)) {
+        if (looksLikeRemoteDesktop(root))
+            sendCharToWindow(hwnd, ch);
+        else
+            insertExactChar(root, hwnd, ch);
+        return;
+    }
     sendPhysicalCharForeground(ch);
 #else
     Q_UNUSED(ch);
@@ -978,15 +1059,17 @@ void TypingEngine::sendVirtualKey(quint16 vk)
 #ifdef Q_OS_WIN
     const WORD key = static_cast<WORD>(vk);
     HWND root = static_cast<HWND>(targetRoot);
-    HWND hwnd = bestEditableControl(root, resolveControl(root, static_cast<HWND>(targetControl)));
-    if (isRemoteTypingContext(root) || useHardwareInjection(root)) {
+    HWND hwnd = destinationWindow(root, static_cast<HWND>(targetControl));
+    if (root && IsWindow(root) && targetIsForeground(root)) {
         sendVirtualForeground(key);
         return;
     }
     if (hwnd && !isOwnedByCurrentProcess(hwnd)) {
-        sendVirtualBackground(hwnd, key);
+        sendKeyToWindow(hwnd, key, scanOf(key), true, isExtendedKey(key));
+        sendKeyToWindow(hwnd, key, scanOf(key), false, isExtendedKey(key));
         return;
     }
+    sendVirtualForeground(key);
 #else
     Q_UNUSED(vk);
 #endif

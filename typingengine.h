@@ -73,7 +73,8 @@ private:
     void abortTypoCleanup();
     void finishRun();
     void notifyProgress();
-    void captureTargetWindow();
+    void watchForeground();
+    void freezeTarget();
     void sendAction(const TypeAction &action);
     void sendWrongKey();
     void sendChar(QChar ch);
@@ -87,6 +88,7 @@ private:
 
     DelayService delays;
     QTimer *timer = nullptr;
+    QTimer *watchTimer = nullptr;
     QList<TypeAction> actions;
     Phase phase = Phase::Idle;
     int index = 0;
@@ -95,8 +97,10 @@ private:
     int continueOffset = 0;
     int toDelete = 0;
     bool running = false;
-    bool needCapture = false;
+    void *lastRoot = nullptr;
+    void *lastControl = nullptr;
     void *targetRoot = nullptr;
+    void *targetControl = nullptr;
 };
 
 #endif // TYPINGENGINE_H

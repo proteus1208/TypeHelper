@@ -131,6 +131,16 @@ HWND captureForegroundTarget()
     return fg;
 }
 
+HWND resolveControl(HWND root, HWND stored)
+{
+    if (stored && IsWindow(stored))
+        return stored;
+    HWND focus = focusedControl(root);
+    if (focus && IsWindow(focus))
+        return focus;
+    return root;
+}
+
 bool windowIsUnder(HWND hwnd, HWND root)
 {
     while (hwnd) {
@@ -185,11 +195,61 @@ void postKey(HWND hwnd, WORD vk, bool down)
 
 void deliverCharMessage(HWND hwnd, ushort code)
 {
+    if (!hwnd || !IsWindow(hwnd))
+        return;
     DWORD_PTR dummy = 0;
-    if (!SendMessageTimeoutW(hwnd, WM_CHAR, code, 1,
-                             SMTO_ABORTIFHUNG | SMTO_NORMAL, 40, &dummy)) {
-        PostMessageW(hwnd, WM_CHAR, code, 1);
+    SendMessageTimeoutW(hwnd, WM_CHAR, code, 1,
+                        SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &dummy);
+}
+
+bool looksLikeRemoteDesktop(HWND hwnd)
+{
+    if (!hwnd)
+        return false;
+
+    wchar_t title[512]{};
+    GetWindowTextW(hwnd, title, 512);
+    const QString t = QString::fromWCharArray(title).toLower();
+    if (t.contains(QLatin1String("anydesk"))
+        || t.contains(QLatin1String("jump desktop"))
+        || t.contains(QLatin1String("jumpdesk"))
+        || t.contains(QLatin1String("teamviewer"))
+        || t.contains(QLatin1String("rustdesk"))
+        || t.contains(QLatin1String("remote desktop"))
+        || t.contains(QLatin1String("splashtop"))
+        || t.contains(QLatin1String("todesk"))) {
+        return true;
     }
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid)
+        return false;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+        return false;
+    wchar_t path[MAX_PATH]{};
+    DWORD size = MAX_PATH;
+    const bool ok = QueryFullProcessImageNameW(process, 0, path, &size) != 0;
+    CloseHandle(process);
+    if (!ok)
+        return false;
+    const QString p = QString::fromWCharArray(path).toLower();
+    return p.contains(QLatin1String("anydesk"))
+        || p.contains(QLatin1String("jumpdesktop"))
+        || p.contains(QLatin1String("jumpdesk"))
+        || p.contains(QLatin1String("teamviewer"))
+        || p.contains(QLatin1String("tv_w32"))
+        || p.contains(QLatin1String("rustdesk"))
+        || p.contains(QLatin1String("mstsc"))
+        || p.contains(QLatin1String("msrdc"))
+        || p.contains(QLatin1String("splashtop"))
+        || p.contains(QLatin1String("todesk"));
+}
+
+bool useHardwareInjection(HWND root)
+{
+    return root && IsWindow(root) && looksLikeRemoteDesktop(root) && targetIsForeground(root);
 }
 
 void sendPhysicalCharForeground(QChar ch)
@@ -229,12 +289,6 @@ void sendPhysicalCharForeground(QChar ch)
 
 void sendPhysicalCharBackground(HWND hwnd, QChar ch)
 {
-    const SHORT mapped = VkKeyScanW(ch.unicode());
-    if (mapped != -1) {
-        const WORD vk = LOBYTE(mapped);
-        postKey(hwnd, vk, true);
-        postKey(hwnd, vk, false);
-    }
     deliverCharMessage(hwnd, ch.unicode());
 }
 
@@ -246,13 +300,19 @@ void sendVirtualForeground(WORD vk)
 
 void sendVirtualBackground(HWND hwnd, WORD vk)
 {
-    postKey(hwnd, vk, true);
-    if (vk == VK_RETURN)
+    if (vk == VK_RETURN) {
         deliverCharMessage(hwnd, '\r');
-    else if (vk == VK_TAB)
+        return;
+    }
+    if (vk == VK_TAB) {
         deliverCharMessage(hwnd, '\t');
-    else if (vk == VK_BACK)
-        PostMessageW(hwnd, WM_CHAR, VK_BACK, keyLParam(vk, true));
+        return;
+    }
+    if (vk == VK_BACK) {
+        deliverCharMessage(hwnd, VK_BACK);
+        return;
+    }
+    postKey(hwnd, vk, true);
     postKey(hwnd, vk, false);
 }
 
@@ -377,9 +437,14 @@ int DelayService::rapidBackspace() const
 TypingEngine::TypingEngine(QObject *parent)
     : QObject(parent)
     , timer(new QTimer(this))
+    , watchTimer(new QTimer(this))
 {
     timer->setSingleShot(true);
     connect(timer, &QTimer::timeout, this, &TypingEngine::onTick);
+    watchTimer->setInterval(80);
+    connect(watchTimer, &QTimer::timeout, this, &TypingEngine::watchForeground);
+    watchTimer->start();
+    watchForeground();
 }
 
 void TypingEngine::setWpm(int wpm)
@@ -400,7 +465,7 @@ void TypingEngine::start(const QString &text, bool autoIndent)
     index = 0;
     phase = Phase::Typing;
     running = true;
-    needCapture = true;
+    freezeTarget();
     notifyProgress();
     timer->start(qBound(520, delays.forAction(actions.first()), 1400));
 }
@@ -419,7 +484,8 @@ void TypingEngine::resume()
         return;
     phase = Phase::Typing;
     running = true;
-    needCapture = true;
+    if (!targetRoot)
+        freezeTarget();
     notifyProgress();
     timer->start(qBound(520, delays.forAction(actions[index]), 1400));
 }
@@ -435,8 +501,8 @@ void TypingEngine::reset()
     continueLeft = 0;
     continueOffset = 0;
     toDelete = 0;
-    needCapture = false;
     targetRoot = nullptr;
+    targetControl = nullptr;
 }
 
 bool TypingEngine::canResume() const
@@ -456,10 +522,38 @@ void TypingEngine::notifyProgress()
     emit progressChanged(percent());
 }
 
-void TypingEngine::captureTargetWindow()
+void TypingEngine::watchForeground()
 {
 #ifdef Q_OS_WIN
-    targetRoot = static_cast<void *>(captureForegroundTarget());
+    if (running)
+        return;
+    HWND fg = GetForegroundWindow();
+    if (!fg || isOwnedByCurrentProcess(fg))
+        return;
+    HWND root = GetAncestor(fg, GA_ROOT);
+    if (!root)
+        root = fg;
+    lastRoot = static_cast<void *>(root);
+    HWND control = focusedControl(root);
+    lastControl = static_cast<void *>(control ? control : root);
+#endif
+}
+
+void TypingEngine::freezeTarget()
+{
+#ifdef Q_OS_WIN
+    HWND root = static_cast<HWND>(lastRoot);
+    HWND control = static_cast<HWND>(lastControl);
+    if (!root || !IsWindow(root)) {
+        root = captureForegroundTarget();
+        control = focusedControl(root);
+    }
+    if (root && isOwnedByCurrentProcess(root)) {
+        root = nextForeignWindow(root);
+        control = focusedControl(root);
+    }
+    targetRoot = static_cast<void *>(root);
+    targetControl = static_cast<void *>(control ? control : root);
 #endif
 }
 
@@ -494,11 +588,6 @@ void TypingEngine::onTick()
 {
     if (!running)
         return;
-
-    if (needCapture) {
-        captureTargetWindow();
-        needCapture = false;
-    }
 
     switch (phase) {
     case Phase::Idle:
@@ -635,16 +724,15 @@ void TypingEngine::sendChar(QChar ch)
 {
 #ifdef Q_OS_WIN
     HWND root = static_cast<HWND>(targetRoot);
-    if (root && IsWindow(root) && targetIsForeground(root)) {
+    HWND hwnd = resolveControl(root, static_cast<HWND>(targetControl));
+    if (useHardwareInjection(root)) {
         sendPhysicalCharForeground(ch);
         return;
     }
-    HWND hwnd = focusedControl(root);
     if (hwnd && !isOwnedByCurrentProcess(hwnd)) {
         sendPhysicalCharBackground(hwnd, ch);
         return;
     }
-    sendPhysicalCharForeground(ch);
 #else
     Q_UNUSED(ch);
 #endif
@@ -655,16 +743,15 @@ void TypingEngine::sendVirtualKey(quint16 vk)
 #ifdef Q_OS_WIN
     const WORD key = static_cast<WORD>(vk);
     HWND root = static_cast<HWND>(targetRoot);
-    if (root && IsWindow(root) && targetIsForeground(root)) {
+    HWND hwnd = resolveControl(root, static_cast<HWND>(targetControl));
+    if (useHardwareInjection(root)) {
         sendVirtualForeground(key);
         return;
     }
-    HWND hwnd = focusedControl(root);
     if (hwnd && !isOwnedByCurrentProcess(hwnd)) {
         sendVirtualBackground(hwnd, key);
         return;
     }
-    sendVirtualForeground(key);
 #else
     Q_UNUSED(vk);
 #endif

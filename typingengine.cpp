@@ -2,6 +2,7 @@
 
 #include <QHash>
 #include <QRandomGenerator>
+#include <QVector>
 
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -193,10 +194,22 @@ void sendInputKey(WORD vk, bool down)
     SendInput(1, &ip, sizeof(INPUT));
 }
 
+void sendInputScan(WORD scan, bool down, bool extended = false)
+{
+    INPUT ip{};
+    ip.type = INPUT_KEYBOARD;
+    ip.ki.wScan = scan;
+    ip.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0 : KEYEVENTF_KEYUP);
+    if (extended)
+        ip.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    SendInput(1, &ip, sizeof(INPUT));
+}
+
 void sendInputUnicode(ushort code)
 {
     INPUT ip[2]{};
     ip[0].type = INPUT_KEYBOARD;
+    ip[0].ki.wVk = 0;
     ip[0].ki.wScan = code;
     ip[0].ki.dwFlags = KEYEVENTF_UNICODE;
     ip[1] = ip[0];
@@ -256,30 +269,106 @@ HWND bestEditableControl(HWND root, HWND hint)
     return hint ? hint : root;
 }
 
+BOOL CALLBACK collectChildWindows(HWND child, LPARAM lp)
+{
+    reinterpret_cast<QVector<HWND> *>(lp)->append(child);
+    return TRUE;
+}
+
+bool tryReplaceSel(HWND hwnd, QChar ch)
+{
+    if (!hwnd || !IsWindow(hwnd))
+        return false;
+    const int before = static_cast<int>(SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0));
+    const wchar_t text[2] = { static_cast<wchar_t>(ch.unicode()), 0 };
+    DWORD_PTR dummy = 0;
+    SendMessageTimeoutW(hwnd, EM_REPLACESEL, TRUE,
+                        reinterpret_cast<LPARAM>(text),
+                        SMTO_ABORTIFHUNG | SMTO_NORMAL, 80, &dummy);
+    const int after = static_cast<int>(SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0));
+    return after > before;
+}
+
+bool tryPasteChar(HWND hwnd, QChar ch)
+{
+    if (!hwnd || !IsWindow(hwnd))
+        return false;
+    if (!OpenClipboard(nullptr))
+        return false;
+
+    QString saved;
+    if (HANDLE existing = GetClipboardData(CF_UNICODETEXT)) {
+        if (auto *p = static_cast<wchar_t *>(GlobalLock(existing))) {
+            saved = QString::fromWCharArray(p);
+            GlobalUnlock(existing);
+        }
+    }
+
+    EmptyClipboard();
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, sizeof(wchar_t) * 2);
+    if (!mem) {
+        CloseClipboard();
+        return false;
+    }
+    auto *p = static_cast<wchar_t *>(GlobalLock(mem));
+    p[0] = static_cast<wchar_t>(ch.unicode());
+    p[1] = 0;
+    GlobalUnlock(mem);
+    SetClipboardData(CF_UNICODETEXT, mem);
+    CloseClipboard();
+
+    const int before = static_cast<int>(SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0));
+    DWORD_PTR dummy = 0;
+    SendMessageTimeoutW(hwnd, WM_PASTE, 0, 0, SMTO_ABORTIFHUNG | SMTO_NORMAL, 80, &dummy);
+    const int after = static_cast<int>(SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0));
+
+    if (OpenClipboard(nullptr)) {
+        EmptyClipboard();
+        if (!saved.isEmpty()) {
+            const int n = saved.size() + 1;
+            HGLOBAL restore = GlobalAlloc(GMEM_MOVEABLE, sizeof(wchar_t) * n);
+            if (restore) {
+                auto *out = static_cast<wchar_t *>(GlobalLock(restore));
+                saved.toWCharArray(out);
+                out[saved.size()] = 0;
+                GlobalUnlock(restore);
+                SetClipboardData(CF_UNICODETEXT, restore);
+            }
+        }
+        CloseClipboard();
+    }
+    return after > before;
+}
+
+void insertExactChar(HWND root, HWND hint, QChar ch)
+{
+    QVector<HWND> candidates;
+    auto add = [&candidates](HWND h) {
+        if (h && IsWindow(h) && !candidates.contains(h))
+            candidates.append(h);
+    };
+    add(hint);
+    add(focusedControl(root));
+    add(root);
+    if (root)
+        EnumChildWindows(root, collectChildWindows, reinterpret_cast<LPARAM>(&candidates));
+
+    for (HWND hwnd : candidates) {
+        if (tryReplaceSel(hwnd, ch))
+            return;
+    }
+    for (HWND hwnd : candidates) {
+        if (tryPasteChar(hwnd, ch))
+            return;
+    }
+}
+
 void deliverCharMessage(HWND hwnd, ushort code)
 {
     if (!hwnd || !IsWindow(hwnd))
         return;
     DWORD_PTR dummy = 0;
     SendMessageTimeoutW(hwnd, WM_CHAR, code, 1,
-                        SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &dummy);
-}
-
-void insertCharDirect(HWND hwnd, QChar ch)
-{
-    if (!hwnd || !IsWindow(hwnd))
-        return;
-
-    const wchar_t text[2] = { static_cast<wchar_t>(ch.unicode()), 0 };
-    DWORD_PTR dummy = 0;
-    if (classLooksEditable(hwnd)) {
-        SendMessageTimeoutW(hwnd, EM_REPLACESEL, TRUE,
-                            reinterpret_cast<LPARAM>(text),
-                            SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &dummy);
-        return;
-    }
-
-    SendMessageTimeoutW(hwnd, WM_CHAR, ch.unicode(), 1,
                         SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &dummy);
 }
 
@@ -350,27 +439,25 @@ void sendPhysicalCharForeground(QChar ch)
     if (vk >= 'A' && vk <= 'Z' && (GetKeyState(VK_CAPITAL) & 1))
         shift = !shift;
 
+    const WORD scan = scanOf(vk);
+    const bool extended = isExtendedKey(vk);
+
     if (shift)
-        sendInputKey(VK_SHIFT, true);
+        sendInputScan(0x2A, true);
     if (ctrl)
-        sendInputKey(VK_CONTROL, true);
+        sendInputScan(0x1D, true);
     if (alt)
-        sendInputKey(VK_MENU, true);
+        sendInputScan(0x38, true);
 
-    sendInputKey(vk, true);
-    sendInputKey(vk, false);
+    sendInputScan(scan, true, extended);
+    sendInputScan(scan, false, extended);
 
     if (alt)
-        sendInputKey(VK_MENU, false);
+        sendInputScan(0x38, false);
     if (ctrl)
-        sendInputKey(VK_CONTROL, false);
+        sendInputScan(0x1D, false);
     if (shift)
-        sendInputKey(VK_SHIFT, false);
-}
-
-void sendPhysicalCharBackground(HWND hwnd, QChar ch)
-{
-    insertCharDirect(hwnd, ch);
+        sendInputScan(0x2A, false);
 }
 
 void sendVirtualForeground(WORD vk)
@@ -809,20 +896,11 @@ void TypingEngine::sendChar(QChar ch)
 #ifdef Q_OS_WIN
     HWND root = static_cast<HWND>(targetRoot);
     HWND hwnd = bestEditableControl(root, resolveControl(root, static_cast<HWND>(targetControl)));
-    if (useHardwareInjection(root)) {
+    if (root && !isOwnedByCurrentProcess(root) && targetIsForeground(root)) {
         sendPhysicalCharForeground(ch);
         return;
     }
-    if (hwnd && !isOwnedByCurrentProcess(hwnd) && classLooksEditable(hwnd)) {
-        insertCharDirect(hwnd, ch);
-        return;
-    }
-    if (targetIsForeground(root) && root && !isOwnedByCurrentProcess(root)) {
-        sendInputUnicode(ch.unicode());
-        return;
-    }
-    if (hwnd && !isOwnedByCurrentProcess(hwnd))
-        insertCharDirect(hwnd, ch);
+    insertExactChar(root, hwnd, ch);
 #else
     Q_UNUSED(ch);
 #endif

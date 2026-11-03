@@ -465,6 +465,35 @@ void appendKeyEvent(QVector<INPUT> *out, WORD vk, WORD scan, bool down, bool ext
     out->append(ip);
 }
 
+void sendShift(bool down)
+{
+    INPUT ip[2]{};
+    ip[0].type = INPUT_KEYBOARD;
+    ip[0].ki.wVk = VK_SHIFT;
+    ip[0].ki.wScan = 0x2A;
+    ip[0].ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+
+    ip[1].type = INPUT_KEYBOARD;
+    ip[1].ki.wVk = VK_LSHIFT;
+    ip[1].ki.wScan = 0x2A;
+    ip[1].ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    SendInput(2, ip, sizeof(INPUT));
+
+    keybd_event(VK_SHIFT, 0x2A, down ? 0 : KEYEVENTF_KEYUP, 0);
+}
+
+void sendVkPulse(WORD vk, WORD scan, bool extended)
+{
+    INPUT ip[2]{};
+    ip[0].type = INPUT_KEYBOARD;
+    ip[0].ki.wVk = vk;
+    ip[0].ki.wScan = scan;
+    ip[0].ki.dwFlags = extended ? KEYEVENTF_EXTENDEDKEY : 0;
+    ip[1] = ip[0];
+    ip[1].ki.dwFlags = (extended ? KEYEVENTF_EXTENDEDKEY : 0) | KEYEVENTF_KEYUP;
+    SendInput(2, ip, sizeof(INPUT));
+}
+
 void sendPhysicalCharForeground(QChar ch)
 {
     const SHORT mapped = VkKeyScanW(ch.unicode());
@@ -475,38 +504,33 @@ void sendPhysicalCharForeground(QChar ch)
 
     const WORD vk = LOBYTE(mapped);
     const BYTE mods = HIBYTE(mapped);
-    bool shift = (mods & 1) != 0;
     const bool ctrl = (mods & 2) != 0;
     const bool alt = (mods & 4) != 0;
-    const bool caps = (GetKeyState(VK_CAPITAL) & 1) != 0;
-
-    if (ch.isLetter())
-        shift = ch.isUpper() ? !caps : caps;
-
+    // Remote sessions have their own Caps Lock. Always send Shift for capitals.
+    const bool shift = ch.isUpper() || ((mods & 1) != 0 && !ch.isLetter());
     const WORD scan = scanOf(vk);
     const bool extended = isExtendedKey(vk);
-    QVector<INPUT> batch;
-    batch.reserve(8);
 
     if (shift)
-        appendKeyEvent(&batch, VK_LSHIFT, 0x2A, true, false);
+        sendShift(true);
     if (ctrl)
-        appendKeyEvent(&batch, VK_LCONTROL, 0x1D, true, false);
+        sendInputKey(VK_LCONTROL, true);
     if (alt)
-        appendKeyEvent(&batch, VK_LMENU, 0x38, true, false);
+        sendInputKey(VK_LMENU, true);
 
-    appendKeyEvent(&batch, vk, scan, true, extended);
-    appendKeyEvent(&batch, vk, scan, false, extended);
-
-    if (alt)
-        appendKeyEvent(&batch, VK_LMENU, 0x38, false, false);
-    if (ctrl)
-        appendKeyEvent(&batch, VK_LCONTROL, 0x1D, false, false);
     if (shift)
-        appendKeyEvent(&batch, VK_LSHIFT, 0x2A, false, false);
+        Sleep(20);
 
-    if (!batch.isEmpty())
-        SendInput(static_cast<UINT>(batch.size()), batch.data(), sizeof(INPUT));
+    sendVkPulse(vk, scan, extended);
+
+    if (alt)
+        sendInputKey(VK_LMENU, false);
+    if (ctrl)
+        sendInputKey(VK_LCONTROL, false);
+    if (shift) {
+        Sleep(10);
+        sendShift(false);
+    }
 }
 
 void sendVirtualForeground(WORD vk)
@@ -943,13 +967,7 @@ void TypingEngine::sendAction(const TypeAction &action)
 void TypingEngine::sendChar(QChar ch)
 {
 #ifdef Q_OS_WIN
-    HWND root = static_cast<HWND>(targetRoot);
-    HWND hwnd = bestEditableControl(root, resolveControl(root, static_cast<HWND>(targetControl)));
-    if (isRemoteTypingContext(root) || (root && !isOwnedByCurrentProcess(root) && targetIsForeground(root))) {
-        sendPhysicalCharForeground(ch);
-        return;
-    }
-    insertExactChar(root, hwnd, ch);
+    sendPhysicalCharForeground(ch);
 #else
     Q_UNUSED(ch);
 #endif

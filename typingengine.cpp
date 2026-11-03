@@ -56,7 +56,24 @@ bool isExtendedKey(WORD vk)
 
 WORD scanOf(WORD vk)
 {
-    return static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+    WORD scan = static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+    if (scan)
+        return scan;
+    switch (vk) {
+    case VK_SHIFT:
+    case VK_LSHIFT:
+        return 0x2A;
+    case VK_RSHIFT:
+        return 0x36;
+    case VK_CONTROL:
+    case VK_LCONTROL:
+        return 0x1D;
+    case VK_MENU:
+    case VK_LMENU:
+        return 0x38;
+    default:
+        return 0;
+    }
 }
 
 LPARAM keyLParam(WORD vk, bool down)
@@ -193,12 +210,76 @@ void postKey(HWND hwnd, WORD vk, bool down)
     PostMessageW(hwnd, msg, vk, keyLParam(vk, down));
 }
 
+bool classLooksEditable(HWND hwnd)
+{
+    if (!hwnd)
+        return false;
+    wchar_t cls[256]{};
+    GetClassNameW(hwnd, cls, 256);
+    const QString c = QString::fromWCharArray(cls).toLower();
+    return c.contains(QLatin1String("edit"))
+        || c.contains(QLatin1String("scintilla"));
+}
+
+struct EditSearch {
+    HWND found = nullptr;
+};
+
+BOOL CALLBACK findEditChild(HWND child, LPARAM lp)
+{
+    if (!IsWindowVisible(child))
+        return TRUE;
+    if (classLooksEditable(child)) {
+        reinterpret_cast<EditSearch *>(lp)->found = child;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+HWND bestEditableControl(HWND root, HWND hint)
+{
+    if (classLooksEditable(hint))
+        return hint;
+    HWND walk = hint;
+    while (walk && walk != root) {
+        if (classLooksEditable(walk))
+            return walk;
+        walk = GetParent(walk);
+    }
+    if (classLooksEditable(root))
+        return root;
+    EditSearch search;
+    if (root)
+        EnumChildWindows(root, findEditChild, reinterpret_cast<LPARAM>(&search));
+    if (search.found)
+        return search.found;
+    return hint ? hint : root;
+}
+
 void deliverCharMessage(HWND hwnd, ushort code)
 {
     if (!hwnd || !IsWindow(hwnd))
         return;
     DWORD_PTR dummy = 0;
     SendMessageTimeoutW(hwnd, WM_CHAR, code, 1,
+                        SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &dummy);
+}
+
+void insertCharDirect(HWND hwnd, QChar ch)
+{
+    if (!hwnd || !IsWindow(hwnd))
+        return;
+
+    const wchar_t text[2] = { static_cast<wchar_t>(ch.unicode()), 0 };
+    DWORD_PTR dummy = 0;
+    if (classLooksEditable(hwnd)) {
+        SendMessageTimeoutW(hwnd, EM_REPLACESEL, TRUE,
+                            reinterpret_cast<LPARAM>(text),
+                            SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &dummy);
+        return;
+    }
+
+    SendMessageTimeoutW(hwnd, WM_CHAR, ch.unicode(), 1,
                         SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &dummy);
 }
 
@@ -270,26 +351,26 @@ void sendPhysicalCharForeground(QChar ch)
         shift = !shift;
 
     if (shift)
-        sendInputKey(VK_LSHIFT, true);
+        sendInputKey(VK_SHIFT, true);
     if (ctrl)
-        sendInputKey(VK_LCONTROL, true);
+        sendInputKey(VK_CONTROL, true);
     if (alt)
-        sendInputKey(VK_LMENU, true);
+        sendInputKey(VK_MENU, true);
 
     sendInputKey(vk, true);
     sendInputKey(vk, false);
 
     if (alt)
-        sendInputKey(VK_LMENU, false);
+        sendInputKey(VK_MENU, false);
     if (ctrl)
-        sendInputKey(VK_LCONTROL, false);
+        sendInputKey(VK_CONTROL, false);
     if (shift)
-        sendInputKey(VK_LSHIFT, false);
+        sendInputKey(VK_SHIFT, false);
 }
 
 void sendPhysicalCharBackground(HWND hwnd, QChar ch)
 {
-    deliverCharMessage(hwnd, ch.unicode());
+    insertCharDirect(hwnd, ch);
 }
 
 void sendVirtualForeground(WORD vk)
@@ -552,6 +633,9 @@ void TypingEngine::freezeTarget()
         root = nextForeignWindow(root);
         control = focusedControl(root);
     }
+    if (!control)
+        control = focusedControl(root);
+    control = bestEditableControl(root, control);
     targetRoot = static_cast<void *>(root);
     targetControl = static_cast<void *>(control ? control : root);
 #endif
@@ -724,15 +808,21 @@ void TypingEngine::sendChar(QChar ch)
 {
 #ifdef Q_OS_WIN
     HWND root = static_cast<HWND>(targetRoot);
-    HWND hwnd = resolveControl(root, static_cast<HWND>(targetControl));
+    HWND hwnd = bestEditableControl(root, resolveControl(root, static_cast<HWND>(targetControl)));
     if (useHardwareInjection(root)) {
         sendPhysicalCharForeground(ch);
         return;
     }
-    if (hwnd && !isOwnedByCurrentProcess(hwnd)) {
-        sendPhysicalCharBackground(hwnd, ch);
+    if (hwnd && !isOwnedByCurrentProcess(hwnd) && classLooksEditable(hwnd)) {
+        insertCharDirect(hwnd, ch);
         return;
     }
+    if (targetIsForeground(root) && root && !isOwnedByCurrentProcess(root)) {
+        sendInputUnicode(ch.unicode());
+        return;
+    }
+    if (hwnd && !isOwnedByCurrentProcess(hwnd))
+        insertCharDirect(hwnd, ch);
 #else
     Q_UNUSED(ch);
 #endif
@@ -743,7 +833,7 @@ void TypingEngine::sendVirtualKey(quint16 vk)
 #ifdef Q_OS_WIN
     const WORD key = static_cast<WORD>(vk);
     HWND root = static_cast<HWND>(targetRoot);
-    HWND hwnd = resolveControl(root, static_cast<HWND>(targetControl));
+    HWND hwnd = bestEditableControl(root, resolveControl(root, static_cast<HWND>(targetControl)));
     if (useHardwareInjection(root)) {
         sendVirtualForeground(key);
         return;

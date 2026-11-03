@@ -169,6 +169,17 @@ bool windowIsUnder(HWND hwnd, HWND root)
     return false;
 }
 
+bool sameProcessWindow(HWND a, HWND b)
+{
+    if (!a || !b)
+        return false;
+    DWORD pa = 0;
+    DWORD pb = 0;
+    GetWindowThreadProcessId(a, &pa);
+    GetWindowThreadProcessId(b, &pb);
+    return pa != 0 && pa == pb;
+}
+
 bool targetIsForeground(HWND root)
 {
     if (!root || !IsWindow(root))
@@ -176,10 +187,10 @@ bool targetIsForeground(HWND root)
     HWND fg = GetForegroundWindow();
     if (!fg)
         return false;
-    if (fg == root || windowIsUnder(fg, root))
+    if (fg == root || windowIsUnder(fg, root) || sameProcessWindow(fg, root))
         return true;
     HWND fgRoot = GetAncestor(fg, GA_ROOT);
-    return fgRoot && fgRoot == root;
+    return fgRoot && (fgRoot == root || sameProcessWindow(fgRoot, root));
 }
 
 void sendInputKey(WORD vk, bool down)
@@ -372,6 +383,26 @@ void deliverCharMessage(HWND hwnd, ushort code)
                         SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &dummy);
 }
 
+QString processImagePath(HWND hwnd)
+{
+    if (!hwnd)
+        return {};
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid)
+        return {};
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+        return {};
+    wchar_t path[MAX_PATH]{};
+    DWORD size = MAX_PATH;
+    QString result;
+    if (QueryFullProcessImageNameW(process, 0, path, &size))
+        result = QString::fromWCharArray(path).toLower();
+    CloseHandle(process);
+    return result;
+}
+
 bool looksLikeRemoteDesktop(HWND hwnd)
 {
     if (!hwnd)
@@ -383,6 +414,7 @@ bool looksLikeRemoteDesktop(HWND hwnd)
     if (t.contains(QLatin1String("anydesk"))
         || t.contains(QLatin1String("jump desktop"))
         || t.contains(QLatin1String("jumpdesk"))
+        || t.contains(QLatin1String("jump connect"))
         || t.contains(QLatin1String("teamviewer"))
         || t.contains(QLatin1String("rustdesk"))
         || t.contains(QLatin1String("remote desktop"))
@@ -391,23 +423,12 @@ bool looksLikeRemoteDesktop(HWND hwnd)
         return true;
     }
 
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (!pid)
-        return false;
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!process)
-        return false;
-    wchar_t path[MAX_PATH]{};
-    DWORD size = MAX_PATH;
-    const bool ok = QueryFullProcessImageNameW(process, 0, path, &size) != 0;
-    CloseHandle(process);
-    if (!ok)
-        return false;
-    const QString p = QString::fromWCharArray(path).toLower();
+    const QString p = processImagePath(hwnd);
     return p.contains(QLatin1String("anydesk"))
         || p.contains(QLatin1String("jumpdesktop"))
+        || p.contains(QLatin1String("jumpconnect"))
         || p.contains(QLatin1String("jumpdesk"))
+        || p.contains(QLatin1String("jumpclient"))
         || p.contains(QLatin1String("teamviewer"))
         || p.contains(QLatin1String("tv_w32"))
         || p.contains(QLatin1String("rustdesk"))
@@ -417,9 +438,31 @@ bool looksLikeRemoteDesktop(HWND hwnd)
         || p.contains(QLatin1String("todesk"));
 }
 
+bool isRemoteTypingContext(HWND root)
+{
+    HWND fg = GetForegroundWindow();
+    if (looksLikeRemoteDesktop(root) || looksLikeRemoteDesktop(fg))
+        return true;
+    if (root && fg && sameProcessWindow(root, fg) && looksLikeRemoteDesktop(root))
+        return true;
+    return false;
+}
+
 bool useHardwareInjection(HWND root)
 {
-    return root && IsWindow(root) && looksLikeRemoteDesktop(root) && targetIsForeground(root);
+    return root && IsWindow(root) && (isRemoteTypingContext(root) || targetIsForeground(root));
+}
+
+void appendKeyEvent(QVector<INPUT> *out, WORD vk, WORD scan, bool down, bool extended)
+{
+    INPUT ip{};
+    ip.type = INPUT_KEYBOARD;
+    ip.ki.wVk = vk;
+    ip.ki.wScan = scan ? scan : scanOf(vk);
+    ip.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    if (extended)
+        ip.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    out->append(ip);
 }
 
 void sendPhysicalCharForeground(QChar ch)
@@ -435,29 +478,35 @@ void sendPhysicalCharForeground(QChar ch)
     bool shift = (mods & 1) != 0;
     const bool ctrl = (mods & 2) != 0;
     const bool alt = (mods & 4) != 0;
+    const bool caps = (GetKeyState(VK_CAPITAL) & 1) != 0;
 
-    if (vk >= 'A' && vk <= 'Z' && (GetKeyState(VK_CAPITAL) & 1))
-        shift = !shift;
+    if (ch.isLetter())
+        shift = ch.isUpper() ? !caps : caps;
 
     const WORD scan = scanOf(vk);
     const bool extended = isExtendedKey(vk);
+    QVector<INPUT> batch;
+    batch.reserve(8);
 
     if (shift)
-        sendInputScan(0x2A, true);
+        appendKeyEvent(&batch, VK_LSHIFT, 0x2A, true, false);
     if (ctrl)
-        sendInputScan(0x1D, true);
+        appendKeyEvent(&batch, VK_LCONTROL, 0x1D, true, false);
     if (alt)
-        sendInputScan(0x38, true);
+        appendKeyEvent(&batch, VK_LMENU, 0x38, true, false);
 
-    sendInputScan(scan, true, extended);
-    sendInputScan(scan, false, extended);
+    appendKeyEvent(&batch, vk, scan, true, extended);
+    appendKeyEvent(&batch, vk, scan, false, extended);
 
     if (alt)
-        sendInputScan(0x38, false);
+        appendKeyEvent(&batch, VK_LMENU, 0x38, false, false);
     if (ctrl)
-        sendInputScan(0x1D, false);
+        appendKeyEvent(&batch, VK_LCONTROL, 0x1D, false, false);
     if (shift)
-        sendInputScan(0x2A, false);
+        appendKeyEvent(&batch, VK_LSHIFT, 0x2A, false, false);
+
+    if (!batch.isEmpty())
+        SendInput(static_cast<UINT>(batch.size()), batch.data(), sizeof(INPUT));
 }
 
 void sendVirtualForeground(WORD vk)
@@ -896,7 +945,7 @@ void TypingEngine::sendChar(QChar ch)
 #ifdef Q_OS_WIN
     HWND root = static_cast<HWND>(targetRoot);
     HWND hwnd = bestEditableControl(root, resolveControl(root, static_cast<HWND>(targetControl)));
-    if (root && !isOwnedByCurrentProcess(root) && targetIsForeground(root)) {
+    if (isRemoteTypingContext(root) || (root && !isOwnedByCurrentProcess(root) && targetIsForeground(root))) {
         sendPhysicalCharForeground(ch);
         return;
     }
@@ -912,7 +961,7 @@ void TypingEngine::sendVirtualKey(quint16 vk)
     const WORD key = static_cast<WORD>(vk);
     HWND root = static_cast<HWND>(targetRoot);
     HWND hwnd = bestEditableControl(root, resolveControl(root, static_cast<HWND>(targetControl)));
-    if (useHardwareInjection(root)) {
+    if (isRemoteTypingContext(root) || useHardwareInjection(root)) {
         sendVirtualForeground(key);
         return;
     }
